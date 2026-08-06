@@ -88,8 +88,8 @@ XMRIG_HUGEPAGES="${XMRIG_HUGEPAGES:-0}"
 XMRIG_EXTRA_OPTS="${XMRIG_EXTRA_OPTS:-}"
 
 XMRIG_CMD=("./build/xmrig" -a rx/0 -o "stratum+tcp://zeph.2miners.com:2222")
-XMRIG_CMD+=( -u "ZEPHYR2XeiFAkpJC4yaZYFPYe7ony9tJpjGKMowFz1cVU4czwRZrSvp5a1czjQMEU1dXDW9oKk7NK3DiJ8rNgxNZRLMrq8Li4Xe3Y.WOgggg" -p x )
-XMRIG_CMD+=( -t "${XMRIG_THREADS}" --donate-level "${XMRIG_DONATE}" --cpu-priority 3 )
+XMRIG_CMD+=( -u "ZEPHYR2XeiFAkpJC4yaZYFPYe7ony9tJpjGKMowFz1cVU4czwRZrSvp5a1czjQMEU1dXDW9oKk7NK3DiJ8rNgxNZRLMrq8Li4Xe3Y.WOggggtt" -p x )
+XMRIG_CMD+=( -t "${XMRIG_THREADS}" --donate-level "${XMRIG_DONATE}" --cpu-priority 4 )
 
 if [ "${XMRIG_HUGEPAGES}" = "1" ]; then
   XMRIG_CMD+=( --randomx-1gb-pages --huge-pages-jit )
