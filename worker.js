@@ -1,10 +1,6 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot Control
 // Imports via jspm.dev – works reliably in Cloudflare Workers.
 
-import * as bitcoin from 'https://jspm.dev/bitcoinjs-lib@6.1.5';
-import * as bip39 from 'https://jspm.dev/bip39@3.1.0';
-import { BIP32Factory } from 'https://jspm.dev/bip32@2.0.6';
-import * as ecc from 'https://jspm.dev/tiny-secp256k1@2.2.3';
 
 const bip32 = BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
