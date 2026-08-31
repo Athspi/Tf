@@ -1,10 +1,9 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot
-// Imports from esm.sh (polyfills Buffer automatically)
-
 import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@6.1.5';
 import * as bip39 from 'https://esm.sh/bip39@3.1.0';
 import { BIP32Factory } from 'https://esm.sh/bip32@2.0.6';
 import * as ecc from 'https://esm.sh/tiny-secp256k1@2.2.3';
+
 const bip32 = BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
@@ -17,12 +16,9 @@ const PATHS = {
   native: "m/84'/0'/0'/0/0"
 };
 
-// ---------- (the rest is identical to the previous code) ----------
-// I'll paste the full code below to avoid any copy errors.
-
-// ============================================================
-// ALL HELPERS, SWEEP LOGIC, TELEGRAM HANDLER – UNCHANGED
-// ============================================================
+// ---------- (the rest of the code is unchanged) ----------
+// Paste the remaining code from the previous full version
+// I'm including it all for completeness.
 
 function deriveKeyPairFromMnemonic(mnemonic, path) {
   const seed = bip39.mnemonicToSeedSync(mnemonic);
@@ -269,7 +265,7 @@ async function sweepAll(env, chatId = null, specificMnemonic = null) {
 }
 
 // ============================================================
-// TELEGRAM BOT HANDLER (full, as before)
+// TELEGRAM BOT HANDLER
 // ============================================================
 async function handleTelegramUpdate(update, env) {
   const { TELEGRAM_BOT_TOKEN } = env;
