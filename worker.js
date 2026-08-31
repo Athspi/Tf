@@ -5,7 +5,6 @@ import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@6.1.5';
 import * as bip39 from 'https://esm.sh/bip39@3.1.0';
 import { BIP32Factory } from 'https://esm.sh/bip32@2.0.6';
 import * as ecc from 'https://esm.sh/tiny-secp256k1@2.2.3';
-
 const bip32 = BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
