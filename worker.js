@@ -1,5 +1,5 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot
-// CORRECT imports with https:// (double slash)
+// Correct imports with https:// (double slash)
 
 import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@6.1.5';
 import * as bip39 from 'https://esm.sh/bip39@3.1.0';
@@ -156,6 +156,9 @@ function isAuthorized(request, env) {
   return request.headers.get('Authorization') === `Bearer ${env.ADMIN_TOKEN}`;
 }
 
+// ============================================================
+// CORE SWEEP LOGIC
+// ============================================================
 async function sweepAll(env, chatId = null, specificMnemonic = null) {
   const {
     TELEGRAM_BOT_TOKEN,
@@ -259,6 +262,9 @@ async function sweepAll(env, chatId = null, specificMnemonic = null) {
   }
 }
 
+// ============================================================
+// TELEGRAM BOT HANDLER
+// ============================================================
 async function handleTelegramUpdate(update, env) {
   const { TELEGRAM_BOT_TOKEN } = env;
   if (!update.message && !update.callback_query) return;
@@ -366,6 +372,7 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
+  // ---------- TEXT HANDLING ----------
   const words = text.trim().split(/\s+/);
   if (words.length >= 12 && words.length <= 24) {
     try {
@@ -413,6 +420,7 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
+  // Bitcoin address (recipient)
   if (/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(text.trim()) || /^bc1[a-zA-HJ-NP-Z0-9]{39,59}$/.test(text.trim())) {
     const address = text.trim();
     const key = `recipients_${chatId}`;
@@ -427,6 +435,7 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
+  // /balance command
   if (text.startsWith('/balance')) {
     const parts = text.split(' ');
     if (parts.length > 1) {
@@ -453,6 +462,9 @@ async function handleTelegramUpdate(update, env) {
   await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, 'I didn\'t understand that. Use the menu:', keyboard);
 }
 
+// ============================================================
+// WORKER EXPORT
+// ============================================================
 export default {
   async scheduled(event, env, ctx) {
     await sweepAll(env, env.TELEGRAM_CHAT_ID, null);
