@@ -1,20 +1,13 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot
-// All imports are dynamic to ensure Buffer is set before any bitcoin lib loads.
+// Imports from esm.sh (polyfills Buffer automatically)
 
-// Polyfill Buffer first
-const { Buffer } = await import('buffer');
-globalThis.Buffer = Buffer;
+import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@6.1.5';
+import * as bip39 from 'https://esm.sh/bip39@3.1.0';
+import { BIP32Factory } from 'https://esm.sh/bip32@2.0.6';
+import * as ecc from 'https://esm.sh/tiny-secp256k1@2.2.3';
 
-// Now dynamically import Bitcoin libraries (they'll have Buffer available)
-const bitcoin = await import('bitcoinjs-lib');
-const bip39 = await import('bip39');
-const { BIP32Factory } = await import('bip32');
-
-// tiny-secp256k1 is a dependency of bitcoinjs-lib, loaded via that import.
-// No need to import it separately.
-
-const bip32 = BIP32Factory(bitcoin.default?.ecc ?? bitcoin.ecc);
-const NETWORK = bitcoin.default?.networks?.bitcoin ?? bitcoin.networks.bitcoin;
+const bip32 = BIP32Factory(ecc);
+const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
 
 const ESPLORA_API = 'https://blockstream.info/api';
@@ -25,26 +18,32 @@ const PATHS = {
   native: "m/84'/0'/0'/0/0"
 };
 
-// ---------- Helper functions (unchanged) ----------
+// ---------- (the rest is identical to the previous code) ----------
+// I'll paste the full code below to avoid any copy errors.
+
+// ============================================================
+// ALL HELPERS, SWEEP LOGIC, TELEGRAM HANDLER – UNCHANGED
+// ============================================================
+
 function deriveKeyPairFromMnemonic(mnemonic, path) {
-  const seed = bip39.default?.mnemonicToSeedSync?.(mnemonic) ?? bip39.mnemonicToSeedSync(mnemonic);
+  const seed = bip39.mnemonicToSeedSync(mnemonic);
   const root = bip32.fromSeed(seed, NETWORK);
   const child = root.derivePath(path);
-  return bitcoin.default?.ECPair?.fromPrivateKey?.(child.privateKey, { network: NETWORK }) ?? bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
+  return bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
 }
 
 function getAddressAndKeyPair(mnemonic, type) {
   const keyPair = deriveKeyPairFromMnemonic(mnemonic, PATHS[type]);
   let payment;
   if (type === 'legacy') {
-    payment = (bitcoin.default?.payments?.p2pkh ?? bitcoin.payments.p2pkh)({ pubkey: keyPair.publicKey, network: NETWORK });
+    payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
   } else if (type === 'segwit') {
-    payment = (bitcoin.default?.payments?.p2sh ?? bitcoin.payments.p2sh)({
-      redeem: (bitcoin.default?.payments?.p2wpkh ?? bitcoin.payments.p2wpkh)({ pubkey: keyPair.publicKey, network: NETWORK }),
+    payment = bitcoin.payments.p2sh({
+      redeem: bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK }),
       network: NETWORK
     });
   } else if (type === 'native') {
-    payment = (bitcoin.default?.payments?.p2wpkh ?? bitcoin.payments.p2wpkh)({ pubkey: keyPair.publicKey, network: NETWORK });
+    payment = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK });
   }
   return { address: payment.address, keyPair };
 }
@@ -56,7 +55,6 @@ function getAllSourceAddresses(mnemonic) {
   });
 }
 
-// ---------- Esplora API (unchanged) ----------
 async function getUtxos(address) {
   const url = `${ESPLORA_API}/address/${address}/utxo`;
   const resp = await fetch(url);
@@ -117,7 +115,7 @@ async function getHighestCompetitorFee(address) {
 }
 
 async function createSweepTx(keyPair, utxos, toAddress, feeSats, rbf = true) {
-  const txb = new (bitcoin.default?.TransactionBuilder ?? bitcoin.TransactionBuilder)(NETWORK);
+  const txb = new bitcoin.TransactionBuilder(NETWORK);
   let totalInput = 0;
   utxos.forEach(utxo => {
     txb.addInput(utxo.txid, utxo.vout);
@@ -149,7 +147,6 @@ async function broadcastTx(txHex) {
   return resp.text();
 }
 
-// ---------- Telegram ----------
 async function sendTelegramMessage(botToken, chatId, text, replyMarkup = null) {
   try {
     const payload = { chat_id: chatId, text, parse_mode: 'HTML' };
@@ -167,7 +164,7 @@ function isAuthorized(request, env) {
 }
 
 // ============================================================
-// CORE SWEEP LOGIC (unchanged)
+// CORE SWEEP LOGIC
 // ============================================================
 async function sweepAll(env, chatId = null, specificMnemonic = null) {
   const {
@@ -273,7 +270,7 @@ async function sweepAll(env, chatId = null, specificMnemonic = null) {
 }
 
 // ============================================================
-// TELEGRAM BOT HANDLER (unchanged)
+// TELEGRAM BOT HANDLER (full, as before)
 // ============================================================
 async function handleTelegramUpdate(update, env) {
   const { TELEGRAM_BOT_TOKEN } = env;
@@ -386,7 +383,7 @@ async function handleTelegramUpdate(update, env) {
   const words = text.trim().split(/\s+/);
   if (words.length >= 12 && words.length <= 24) {
     try {
-      if (!bip39.default?.validateMnemonic?.(words.join(' ')) ?? !bip39.validateMnemonic(words.join(' '))) {
+      if (!bip39.validateMnemonic(words.join(' '))) {
         await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid mnemonic.');
         return;
       }
@@ -411,8 +408,8 @@ async function handleTelegramUpdate(update, env) {
   if (/^[LK5][1-9A-HJ-NP-Za-km-z]{50,51}$/.test(text.trim())) {
     try {
       const wif = text.trim();
-      const keyPair = bitcoin.default?.ECPair?.fromWIF?.(wif, NETWORK) ?? bitcoin.ECPair.fromWIF(wif, NETWORK);
-      const address = (bitcoin.default?.payments?.p2pkh ?? bitcoin.payments.p2pkh)({ pubkey: keyPair.publicKey, network: NETWORK }).address;
+      const keyPair = bitcoin.ECPair.fromWIF(wif, NETWORK);
+      const address = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK }).address;
       const key = `wallets_${chatId}`;
       const wallets = await env.WALLETS.get(key, 'json') || [];
       const exists = wallets.some(w => w.wif === wif);
