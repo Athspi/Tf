@@ -1,9 +1,9 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot
 // Correct imports with https:// (double slash)
 import * as bitcoin from 'bitcoinjs-lib';
-import * as bip39 from 'https://esm.sh/bip39@3.1.0';
-import { BIP32Factory } from 'https://esm.sh/bip32@2.0.6';
-import * as ecc from 'https://esm.sh/tiny-secp256k1@2.2.3';
+import * as bip39 from 'bip39';
+import { BIP32Factory } from 'bip32@';
+import * as ecc from 'tiny-secp256k1@';
 
 const bip32 = BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
