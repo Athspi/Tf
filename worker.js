@@ -1,14 +1,17 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot
-// worker.js – Bitcoin Auto-Sweeper with Telegram Bot
-// Buffer polyfill for Cloudflare Workers
+// Use dynamic import to ensure Buffer is defined before tiny-secp256k1 loads.
+
 import { Buffer } from 'buffer';
 globalThis.Buffer = Buffer;
 
-// Bitcoin libraries
+// Dynamically import tiny-secp256k1 after Buffer is set
+const eccModule = await import('tiny-secp256k1');
+const ecc = eccModule.default; // or eccModule if it's a namespace
+
+// Now import other modules (they may also need Buffer, but it's already set)
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
 import { BIP32Factory } from 'bip32';
-import * as ecc from 'tiny-secp256k1';   // now works because Buffer is defined
 
 const bip32 = BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
@@ -22,7 +25,20 @@ const PATHS = {
   native: "m/84'/0'/0'/0/0"
 };
 
-// ---------- Helpers ----------
+// ---------- (the rest of your code stays exactly the same) ----------
+// I'll include the complete code below for convenience, but you can copy from your previous version.
+// Just make sure the top part is as shown above.
+
+// ============================================================
+// All helper functions, sweepAll, handleTelegramUpdate, and export
+// must be defined below. They are identical to the previous version.
+// ============================================================
+
+// Since the dynamic import is top-level, the entire module becomes async.
+// We must wrap the worker export in an async function or use top-level await.
+// The code below uses top-level await, which is supported in Workers with module syntax.
+
+// ---------- Helper functions (unchanged) ----------
 function deriveKeyPairFromMnemonic(mnemonic, path) {
   const seed = bip39.mnemonicToSeedSync(mnemonic);
   const root = bip32.fromSeed(seed, NETWORK);
@@ -53,7 +69,7 @@ function getAllSourceAddresses(mnemonic) {
   });
 }
 
-// ---------- Esplora API ----------
+// ---------- Esplora API (unchanged) ----------
 async function getUtxos(address) {
   const url = `${ESPLORA_API}/address/${address}/utxo`;
   const resp = await fetch(url);
@@ -164,7 +180,7 @@ function isAuthorized(request, env) {
 }
 
 // ============================================================
-// CORE SWEEP LOGIC
+// CORE SWEEP LOGIC (unchanged)
 // ============================================================
 async function sweepAll(env, chatId = null, specificMnemonic = null) {
   const {
@@ -270,7 +286,7 @@ async function sweepAll(env, chatId = null, specificMnemonic = null) {
 }
 
 // ============================================================
-// TELEGRAM BOT HANDLER
+// TELEGRAM BOT HANDLER (unchanged)
 // ============================================================
 async function handleTelegramUpdate(update, env) {
   const { TELEGRAM_BOT_TOKEN } = env;
