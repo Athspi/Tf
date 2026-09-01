@@ -3,12 +3,12 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
-import BIP32Factory from 'bip32';
+import * as bip32lib from 'bip32';
 import * as ecc from 'tiny-secp256k1';
 import { Buffer } from 'buffer';
 globalThis.Buffer = Buffer;
 
-const bip32 = BIP32Factory(ecc);
+const bip32 = bip32lib.BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
 
