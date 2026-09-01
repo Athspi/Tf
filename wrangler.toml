@@ -8,7 +8,8 @@ binding = "WALLETS"
 id = "67b59cb22d0743b8a53d4072e41699e4"
 
 [triggers]
-crons = ["*/15 * * * * *"]
+# Changed from 6 fields to 5 fields. This runs every 15 minutes.
+crons = ["*/15 * * * *"]
 
 [vars]
 MIN_BALANCE_TO_SWEEP = "10000"
