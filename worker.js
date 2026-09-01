@@ -4,9 +4,11 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot
 // Local npm packages
 
+// worker.js – Bitcoin Auto-Sweeper with Telegram Bot
+
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
-import BIP32Factory from 'bip32';
+import { BIP32Factory } from 'bip32'; // Named import works perfectly in v5.0.1
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { Buffer } from 'buffer';
 
@@ -17,6 +19,7 @@ const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
 
 const ESPLORA_API = 'https://blockstream.info/api';
+// ... (the rest of your code remains exactly the same)
 // ... (the rest of your code remains exactly the same)
 
 const PATHS = {
