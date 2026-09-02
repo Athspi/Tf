@@ -1,7 +1,3 @@
-// worker.js – Ultimate Bitcoin Auto-Sweeper with Telegram Bot
-// Supports: Mnemonic, WIF, Hex, xprv, yprv, zprv
-// Trust Wallet-style multi-index address scanning
-
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
 import { BIP32Factory } from 'bip32';
