@@ -1,14 +1,8 @@
 // worker.js – Bitcoin Auto-Sweeper with Telegram Bot
-// Local npm packages
-
-// worker.js – Bitcoin Auto-Sweeper with Telegram Bot
-// Local npm packages
-
-// worker.js – Bitcoin Auto-Sweeper with Telegram Bot
 
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
-import { BIP32Factory } from 'bip32'; // Named import works perfectly in v5.0.1
+import { BIP32Factory } from 'bip32';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { Buffer } from 'buffer';
 
@@ -17,10 +11,7 @@ globalThis.Buffer = Buffer;
 const bip32 = BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
-
 const ESPLORA_API = 'https://blockstream.info/api';
-// ... (the rest of your code remains exactly the same)
-// ... (the rest of your code remains exactly the same)
 
 const PATHS = {
   legacy: "m/44'/0'/0'/0/0",
@@ -152,14 +143,26 @@ async function broadcastTx(txHex) {
 
 async function sendTelegramMessage(botToken, chatId, text, replyMarkup = null) {
   try {
+    if (!botToken) {
+      console.error('❌ CRITICAL: TELEGRAM_BOT_TOKEN is missing in environment variables!');
+      return;
+    }
     const payload = { chat_id: chatId, text, parse_mode: 'HTML' };
     if (replyMarkup) payload.reply_markup = replyMarkup;
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-  } catch (e) { console.error('Telegram send error:', e); }
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('❌ Telegram API Error:', response.status, errorText);
+    }
+  } catch (e) { 
+    console.error('❌ Telegram send error:', e); 
+  }
 }
 
 function isAuthorized(request, env) {
@@ -174,9 +177,9 @@ async function sweepAll(env, chatId = null, specificMnemonic = null) {
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     MASTER_ADDRESS,
-    MIN_BALANCE_TO_SWEEP = 10000,
-    MAX_FEE_RATE = 50,
-    FEE_BUMP = 3
+    MIN_BALANCE_TO_SWEEP = "10000",
+    MAX_FEE_RATE = "50",
+    FEE_BUMP = "3"
   } = env;
 
   const targetChatId = chatId || TELEGRAM_CHAT_ID;
@@ -276,6 +279,9 @@ async function sweepAll(env, chatId = null, specificMnemonic = null) {
 // TELEGRAM BOT HANDLER
 // ============================================================
 async function handleTelegramUpdate(update, env) {
+  console.log("🔍 UPDATE RECEIVED:", JSON.stringify(update));
+  console.log("🔑 BOT TOKEN EXISTS:", !!env.TELEGRAM_BOT_TOKEN);
+
   const { TELEGRAM_BOT_TOKEN } = env;
   if (!update.message && !update.callback_query) return;
 
@@ -296,7 +302,8 @@ async function handleTelegramUpdate(update, env) {
 
   if (!chatId) return;
 
-  if (text === '/start' || text === '/menu') {
+  // FIXED: Allow /start@YourBotName which Telegram often sends
+  if (text === '/start' || text.startsWith('/start') || text === '/menu') {
     const keyboard = {
       inline_keyboard: [
         [{ text: '🔑 Import Wallet', callback_data: 'import' }],
@@ -308,17 +315,14 @@ async function handleTelegramUpdate(update, env) {
         [{ text: '🧪 Test API', callback_data: 'testapi' }]
       ]
     };
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-      '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:',
-      keyboard);
+    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', keyboard);
     return;
   }
 
   if (callbackData) {
     switch (callbackData) {
       case 'import':
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-          '🔑 Send me your <b>mnemonic</b> (12/24 words) or <b>WIF private key</b>.\n\nExample:\n<code>abandon abandon ...</code>\nor\n<code>L5...</code>');
+        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🔑 Send me your <b>mnemonic</b> (12/24 words) or <b>WIF private key</b>.\n\nExample:\n<code>abandon abandon ...</code>\nor\n<code>L5...</code>');
         break;
       case 'list': {
         const key = `wallets_${chatId}`;
@@ -337,16 +341,14 @@ async function handleTelegramUpdate(update, env) {
         break;
       }
       case 'addrecipient':
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-          '➕ Send me a Bitcoin address to add as a recipient (destination).\n\nExample: <code>bc1q...</code>');
+        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '➕ Send me a Bitcoin address to add as a recipient (destination).\n\nExample: <code>bc1q...</code>');
         break;
       case 'sweep':
         await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets...');
         await sweepAll(env, chatId, null);
         break;
       case 'balance':
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-          '📊 Send me a Bitcoin address to check its balance.');
+        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '📊 Send me a Bitcoin address to check its balance.');
         break;
       case 'pause':
         await env.WALLETS.put('PAUSED', 'true');
@@ -480,10 +482,11 @@ export default {
     await sweepAll(env, env.TELEGRAM_CHAT_ID, null);
   },
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
 
+    // Telegram webhook must be checked BEFORE authorization
     if (request.method === 'POST' && pathname === '/telegram-webhook') {
       const secret = env.TELEGRAM_WEBHOOK_SECRET;
       const received = request.headers.get('X-Telegram-Webhook-Secret');
@@ -491,7 +494,7 @@ export default {
         return new Response('Unauthorized', { status: 401 });
       }
       const update = await request.json();
-      await handleTelegramUpdate(update, env);
+      ctx.waitUntil(handleTelegramUpdate(update, env));
       return new Response('OK');
     }
 
@@ -501,7 +504,7 @@ export default {
 
     if (request.method === 'POST' && pathname === '/add-wallet') {
       const address = url.searchParams.get('address');
-      if (!address || !/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(address) && !/^bc1[a-zA-HJ-NP-Z0-9]{39,59}$/.test(address)) {
+      if (!address || (!/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(address) && !/^bc1[a-zA-HJ-NP-Z0-9]{39,59}$/.test(address))) {
         return new Response('Invalid Bitcoin address', { status: 400 });
       }
       const recipients = (await env.WALLETS.get('recipients', 'json')) || [];
@@ -523,7 +526,7 @@ export default {
 
     if (request.method === 'POST' && pathname === '/sweep') {
       const chatId = url.searchParams.get('chatId') || env.TELEGRAM_CHAT_ID;
-      await sweepAll(env, chatId, null);
+      ctx.waitUntil(sweepAll(env, chatId, null));
       return new Response('Sweep triggered');
     }
 
