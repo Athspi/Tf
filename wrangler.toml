@@ -8,7 +8,6 @@ binding = "WALLETS"
 id = "67b59cb22d0743b8a53d4072e41699e4"
 
 [triggers]
-# Changed from 6 fields to 5 fields. This runs every 15 minutes.
 crons = ["*/15 * * * *"]
 
 [vars]
@@ -16,3 +15,4 @@ MIN_BALANCE_TO_SWEEP = "10000"
 MAX_FEE_RATE = "50"
 FEE_BUMP = "3"
 MASTER_ADDRESS = "bc1q60pscuz4nr8f8q48qgadregd76pljachctc0wd"
+SCAN_DEPTH = "10"
