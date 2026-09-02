@@ -279,19 +279,19 @@ async function sweepAll(env, chatId = null, specificMnemonic = null) {
 // TELEGRAM BOT HANDLER
 // ============================================================
 async function handleTelegramUpdate(update, env) {
-  console.log("🔍 UPDATE RECEIVED:", JSON.stringify(update));
+  console.log("🔍 UPDATE RECEIVED:", JSON.stringify(update).substring(0, 100));
   console.log("🔑 BOT TOKEN EXISTS:", !!env.TELEGRAM_BOT_TOKEN);
 
   const { TELEGRAM_BOT_TOKEN } = env;
   if (!update.message && !update.callback_query) return;
 
-  let chatId, text, callbackData;
+  let chatId, text = '', callbackData; // FIXED: default text to empty string
 
   if (update.message) {
     chatId = update.message.chat.id;
     text = update.message.text || '';
   } else if (update.callback_query) {
-    chatId = update.callback_query.message.chat.id;
+    chatId = update.callback_query.message?.chat?.id || update.callback_query.from.id;
     callbackData = update.callback_query.data;
     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
       method: 'POST',
@@ -302,24 +302,26 @@ async function handleTelegramUpdate(update, env) {
 
   if (!chatId) return;
 
-  // FIXED: Allow /start@YourBotName which Telegram often sends
-  if (text === '/start' || text.startsWith('/start') || text === '/menu') {
-    const keyboard = {
-      inline_keyboard: [
-        [{ text: '🔑 Import Wallet', callback_data: 'import' }],
-        [{ text: '📋 List Wallets', callback_data: 'list' }],
-        [{ text: '➕ Add Recipient', callback_data: 'addrecipient' }],
-        [{ text: '🧹 Sweep All', callback_data: 'sweep' }],
-        [{ text: '📊 Check Balance', callback_data: 'balance' }],
-        [{ text: '⏸️ Pause', callback_data: 'pause' }, { text: '▶️ Resume', callback_data: 'resume' }],
-        [{ text: '🧪 Test API', callback_data: 'testapi' }]
-      ]
-    };
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', keyboard);
-    return;
-  }
-
+  // ============================================================
+  // HANDLE BUTTON CLICKS (CALLBACK DATA)
+  // ============================================================
   if (callbackData) {
+    if (callbackData === 'menu' || callbackData === 'start') {
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: '🔑 Import Wallet', callback_data: 'import' }],
+          [{ text: '📋 List Wallets', callback_data: 'list' }],
+          [{ text: '➕ Add Recipient', callback_data: 'addrecipient' }],
+          [{ text: '🧹 Sweep All', callback_data: 'sweep' }],
+          [{ text: '📊 Check Balance', callback_data: 'balance' }],
+          [{ text: '⏸️ Pause', callback_data: 'pause' }, { text: '▶️ Resume', callback_data: 'resume' }],
+          [{ text: '🧪 Test API', callback_data: 'testapi' }]
+        ]
+      };
+      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', keyboard);
+      return;
+    }
+
     switch (callbackData) {
       case 'import':
         await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🔑 Send me your <b>mnemonic</b> (12/24 words) or <b>WIF private key</b>.\n\nExample:\n<code>abandon abandon ...</code>\nor\n<code>L5...</code>');
@@ -377,14 +379,88 @@ async function handleTelegramUpdate(update, env) {
       default:
         await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, 'Unknown action.');
     }
-    const keyboard = {
-      inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: 'menu' }]]
-    };
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, 'Back to menu:', keyboard);
     return;
   }
 
-  // ---------- TEXT HANDLING ----------
+  // ============================================================
+  // HANDLE TEXT COMMANDS
+  // ============================================================
+  
+  // Main Menu
+  if (text === '/start' || text.startsWith('/start') || text === '/menu') {
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '🔑 Import Wallet', callback_data: 'import' }],
+        [{ text: '📋 List Wallets', callback_data: 'list' }],
+        [{ text: '➕ Add Recipient', callback_data: 'addrecipient' }],
+        [{ text: '🧹 Sweep All', callback_data: 'sweep' }],
+        [{ text: '📊 Check Balance', callback_data: 'balance' }],
+        [{ text: '⏸️ Pause', callback_data: 'pause' }, { text: '▶️ Resume', callback_data: 'resume' }],
+        [{ text: '🧪 Test API', callback_data: 'testapi' }]
+      ]
+    };
+    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', keyboard);
+    return;
+  }
+
+  // Text Commands
+  if (text === '/import') {
+    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🔑 Send me your <b>mnemonic</b> (12/24 words) or <b>WIF private key</b>.\n\nExample:\n<code>abandon abandon ...</code>\nor\n<code>L5...</code>');
+    return;
+  }
+  if (text === '/list') {
+    const key = `wallets_${chatId}`;
+    const storedWallets = await env.WALLETS.get(key, 'json') || [];
+    if (storedWallets.length === 0) {
+      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '📭 No wallets imported.');
+    } else {
+      let msg = '📋 <b>Your Wallets:</b>\n\n';
+      for (const w of storedWallets) {
+        const label = w.label || 'Unnamed';
+        const first = getAllSourceAddresses(w.mnemonic || w.wif)[0];
+        msg += `🔹 <b>${label}</b>\n   ${first.address}\n`;
+      }
+      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, msg);
+    }
+    return;
+  }
+  if (text === '/sweep') {
+    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets...');
+    await sweepAll(env, chatId, null);
+    return;
+  }
+  if (text === '/pause') {
+    await env.WALLETS.put('PAUSED', 'true');
+    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '⏸️ Sweeper paused.');
+    return;
+  }
+  if (text === '/resume') {
+    await env.WALLETS.put('PAUSED', 'false');
+    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '▶️ Sweeper resumed.');
+    return;
+  }
+  if (text === '/testapi') {
+    try {
+      const fee = await getRecommendedFee();
+      const testAddress = 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq';
+      const utxos = await getUtxos(testAddress);
+      const balance = utxos.reduce((sum, u) => sum + u.value, 0);
+      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
+        `🧪 <b>API Test Results</b>\n\n` +
+        `✅ Esplora reachable\n` +
+        `💰 Test address balance: ${(balance/1e8).toFixed(8)} BTC\n` +
+        `💸 Current fee: ${fee} sat/vbyte`);
+    } catch (e) {
+      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, `❌ API test failed:\n${e.message}`);
+    }
+    return;
+  }
+
+  // ============================================================
+  // HANDLE TEXT INPUT (MNEMONICS, WIF, ADDRESSES)
+  // ============================================================
+  
+  // 12/24 Word Mnemonic
   const words = text.trim().split(/\s+/);
   if (words.length >= 12 && words.length <= 24) {
     try {
@@ -410,6 +486,7 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
+  // WIF Private Key
   if (/^[LK5][1-9A-HJ-NP-Za-km-z]{50,51}$/.test(text.trim())) {
     try {
       const wif = text.trim();
@@ -432,7 +509,7 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // Bitcoin address (recipient)
+  // Bitcoin Address (Recipient)
   if (/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(text.trim()) || /^bc1[a-zA-HJ-NP-Z0-9]{39,59}$/.test(text.trim())) {
     const address = text.trim();
     const key = `recipients_${chatId}`;
@@ -447,7 +524,7 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /balance command
+  // /balance Command
   if (text.startsWith('/balance')) {
     const parts = text.split(' ');
     if (parts.length > 1) {
@@ -468,6 +545,7 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
+  // Fallback
   const keyboard = {
     inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: 'menu' }]]
   };
