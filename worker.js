@@ -6,10 +6,12 @@ import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
 import { BIP32Factory } from 'bip32';
 import * as ecc from '@bitcoinerlab/secp256k1';
+import ECPairFactory from 'ecpair';
 import { Buffer } from 'buffer';
 
 globalThis.Buffer = Buffer;
 const bip32 = BIP32Factory(ecc);
+const ECPair = ECPairFactory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
 const ESPLORA_API = 'https://blockstream.info/api';
@@ -24,7 +26,7 @@ const PATHS = {
 };
 
 // ============================================================
-// KEY DETECTION & IMPORT HELPERS
+// KEY DETECTION
 // ============================================================
 function detectKeyType(text) {
   const t = text.trim();
@@ -54,7 +56,7 @@ function deriveAddressesFromMnemonic(mnemonic, scanDepth = 10) {
         try {
           const child = root.derivePath(`${basePath}/${i}`);
           if (!child.privateKey) continue;
-          const keyPair = bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
+          const keyPair = ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
           let payment;
           if (type === 'legacy') {
             payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
@@ -86,7 +88,7 @@ function deriveAddressesFromXprv(xprvKey, scanDepth = 10) {
       try {
         const child = node.derive(0).derive(i);
         if (!child.privateKey) continue;
-        const keyPair = bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
+        const keyPair = ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
         const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
         if (payment.address) {
           results.push({ address: payment.address, keyPair, type: 'xprv', index: i });
@@ -101,7 +103,7 @@ function deriveAddressesFromXprv(xprvKey, scanDepth = 10) {
 
 function deriveAddressesFromWif(wif) {
   try {
-    const keyPair = bitcoin.ECPair.fromWIF(wif, NETWORK);
+    const keyPair = ECPair.fromWIF(wif, NETWORK);
     const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
     return [{ address: payment.address, keyPair, type: 'wif', index: 0 }];
   } catch (e) {
@@ -112,7 +114,7 @@ function deriveAddressesFromWif(wif) {
 
 function deriveAddressesFromHex(hex) {
   try {
-    const keyPair = bitcoin.ECPair.fromPrivateKey(Buffer.from(hex, 'hex'), { network: NETWORK });
+    const keyPair = ECPair.fromPrivateKey(Buffer.from(hex, 'hex'), { network: NETWORK });
     const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
     return [{ address: payment.address, keyPair, type: 'hex', index: 0 }];
   } catch (e) {
@@ -180,7 +182,7 @@ async function createSweepTx(keyPair, utxos, toAddress, feeRate) {
   const txb = new bitcoin.TransactionBuilder(NETWORK);
   utxos.forEach(utxo => {
     txb.addInput(utxo.txid, utxo.vout);
-    txb.setInputSequence(txb.inputs.length - 1, 0xfffffffd); // RBF
+    txb.setInputSequence(txb.inputs.length - 1, 0xfffffffd);
   });
   txb.addOutput(toAddress, amountToSend);
   utxos.forEach((_, i) => txb.sign(i, keyPair));
@@ -464,7 +466,6 @@ async function handleTelegramUpdate(update, env) {
         break;
       }
       default: {
-        // Handle dynamic buttons: del_0, send_0, etc.
         if (callbackData.startsWith('del_')) {
           const idx = parseInt(callbackData.split('_')[1]);
           const wallets = await getWallets(env, chatId);
@@ -493,7 +494,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /balance - check all wallets or specific address
   if (trimmed === '/balance' || trimmed.startsWith('/balance')) {
     const parts = trimmed.split(' ');
     if (parts.length > 1) {
@@ -517,7 +517,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /add <address>
   if (trimmed.startsWith('/add')) {
     const parts = trimmed.split(' ');
     if (parts.length < 2) {
@@ -541,7 +540,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /remove <address>
   if (trimmed.startsWith('/remove')) {
     const parts = trimmed.split(' ');
     if (parts.length < 2) {
@@ -561,7 +559,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /recipients - list all
   if (trimmed === '/recipients') {
     const recipients = await getRecipients(env, chatId);
     if (recipients.length === 0) {
@@ -572,7 +569,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /send <address> - sweep to specific address
   if (trimmed.startsWith('/send')) {
     const parts = trimmed.split(' ');
     if (parts.length < 2) {
@@ -590,14 +586,12 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /sweep
   if (trimmed === '/sweep') {
     await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets to MASTER_ADDRESS...');
     await sweepAll(env, chatId);
     return;
   }
 
-  // /pause, /resume, /import, /list
   if (trimmed === '/pause') { await env.WALLETS.put('PAUSED', 'true'); await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⏸️ Paused.'); return; }
   if (trimmed === '/resume') { await env.WALLETS.put('PAUSED', 'false'); await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '▶️ Resumed.'); return; }
   if (trimmed === '/list') {
@@ -626,7 +620,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // Fallback
   await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❓ I didn\'t understand. Use /start for the menu.', mainMenuKeyboard());
 }
 
