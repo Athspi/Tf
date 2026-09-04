@@ -11,6 +11,8 @@ import { Buffer } from 'buffer';
 globalThis.Buffer = Buffer;
 const bip32 = BIP32Factory(ecc);
 const ECPair = ECPairFactory(ecc);
+bitcoin.initEccLib(ecc); // CRITICAL FIX for v6 isPoint validation
+
 const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
 const ESPLORA_API = 'https://blockstream.info/api';
@@ -133,6 +135,12 @@ async function getUtxos(address) {
   } catch { return []; }
 }
 
+async function getTxHex(txid) {
+  const resp = await fetch(`${ESPLORA_API}/tx/${txid}/hex`);
+  if (!resp.ok) throw new Error(`Failed to get raw tx hex for ${txid}`);
+  return resp.text();
+}
+
 async function getAddressBalance(address) {
   try {
     const resp = await fetch(`${ESPLORA_API}/address/${address}`);
@@ -174,9 +182,9 @@ function formatBtc(sats) {
 }
 
 // ============================================================
-// TRANSACTION BUILDING
+// TRANSACTION BUILDING (Psbt for v6)
 // ============================================================
-async function createSweepTx(keyPair, utxos, toAddress, feeRate) {
+async function createSweepTx(keyPair, utxos, toAddress, feeRate, addrType) {
   const inputCount = utxos.length;
   const estimatedVBytes = inputCount * 180 + 34 + 10;
   const feeSats = estimatedVBytes * feeRate;
@@ -184,15 +192,54 @@ async function createSweepTx(keyPair, utxos, toAddress, feeRate) {
   const amountToSend = totalInput - feeSats;
   if (amountToSend <= 546) return { error: `Balance ${totalInput} sats too low for fee ${feeSats} sats` };
 
-  const txb = new bitcoin.TransactionBuilder(NETWORK);
-  utxos.forEach(utxo => {
-    txb.addInput(utxo.txid, utxo.vout);
-    txb.setInputSequence(txb.inputs.length - 1, 0xfffffffd);
-  });
-  txb.addOutput(toAddress, amountToSend);
-  utxos.forEach((_, i) => txb.sign(i, keyPair));
+  const psbt = new bitcoin.Psbt({ network: NETWORK });
 
-  return { hex: txb.build().toHex(), amount: amountToSend, fee: feeSats };
+  for (const utxo of utxos) {
+    const isLegacy = (addrType === 'legacy' || addrType === 'wif' || addrType === 'hex' || addrType === 'xprv');
+    
+    if (isLegacy) {
+      // Legacy requires the full raw transaction hex
+      const txHex = await getTxHex(utxo.txid);
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+        nonWitnessUtxo: Buffer.from(txHex, 'hex'),
+      });
+    } else {
+      // Segwit/Native only requires the scriptPubKey and value
+      let payment;
+      if (addrType === 'segwit') {
+        payment = bitcoin.payments.p2sh({
+          redeem: bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK }),
+          network: NETWORK
+        });
+      } else { // native
+        payment = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK });
+      }
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+        witnessUtxo: {
+          script: payment.output,
+          value: utxo.value,
+        },
+      });
+      if (addrType === 'segwit') {
+        psbt.updateInput(psbt.inputCount - 1, { redeemScript: payment.redeem.output });
+      }
+    }
+  }
+
+  psbt.addOutput({ address: toAddress, value: amountToSend });
+  
+  for (let i = 0; i < utxos.length; i++) {
+    psbt.signInput(i, keyPair);
+  }
+  
+  psbt.finalizeAllInputs();
+  const tx = psbt.extractTransaction();
+  
+  return { hex: tx.toHex(), amount: amountToSend, fee: feeSats };
 }
 
 async function broadcastTx(txHex) {
@@ -296,7 +343,8 @@ async function sweepAll(env, chatId, targetAddress = null) {
         if (balance < parseInt(MIN_BALANCE_TO_SWEEP)) continue;
 
         const feeRate = Math.min(await getRecommendedFee(), parseInt(MAX_FEE_RATE));
-        const result = await createSweepTx(addr.keyPair, utxos, dest, feeRate);
+        // Pass addr.type to createSweepTx so it knows if it's legacy or segwit
+        const result = await createSweepTx(addr.keyPair, utxos, dest, feeRate, addr.type);
         if (result.error) {
           report.push(`⚠️ ${wallet.label} (${addr.address}): ${result.error}`);
           continue;
@@ -594,7 +642,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /balance <address> or /balance (all wallets)
   if (trimmed === '/balance') {
     await checkAllBalances(env, chatId);
     return;
@@ -609,7 +656,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /txs <address> - check latest transactions
   if (trimmed.startsWith('/txs')) {
     const parts = trimmed.split(' ');
     if (parts.length > 1) {
@@ -620,7 +666,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /scan <address> - full scan (balance + txs)
   if (trimmed.startsWith('/scan')) {
     const parts = trimmed.split(' ');
     if (parts.length > 1) {
@@ -631,7 +676,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /add <address>
   if (trimmed.startsWith('/add')) {
     const parts = trimmed.split(' ');
     if (parts.length < 2) {
@@ -655,7 +699,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /remove <address>
   if (trimmed.startsWith('/remove')) {
     const parts = trimmed.split(' ');
     if (parts.length < 2) {
@@ -675,7 +718,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /recipients
   if (trimmed === '/recipients') {
     const recipients = await getRecipients(env, chatId);
     if (recipients.length === 0) {
@@ -686,7 +728,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /send <address>
   if (trimmed.startsWith('/send')) {
     const parts = trimmed.split(' ');
     if (parts.length < 2) {
@@ -704,7 +745,6 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // /sweep
   if (trimmed === '/sweep') {
     await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets...');
     await sweepAll(env, chatId);
@@ -719,13 +759,11 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  // ---- BULK KEY DETECTION (comma separated) ----
   if (trimmed.includes(',')) {
     await importBulkKeys(env, chatId, trimmed);
     return;
   }
 
-  // ---- SINGLE KEY / ADDRESS INPUT ----
   const keyType = detectKeyType(trimmed);
   if (keyType === 'mnemonic' || keyType === 'wif' || keyType === 'hex' ||
       keyType === 'xprv' || keyType === 'yprv' || keyType === 'zprv' || keyType === 'tprv') {
