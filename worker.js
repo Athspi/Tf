@@ -532,4 +532,4 @@ async function checkAddressInfo(env, chatId, address, showTxs = false) {
   await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `🔍 Checking <code>${address}</code>...`);
 
   const balance = await getAddressBalance(address);
-  let msg = `📊 <b>Address:</b> <code>${address}</code>\n💰 <b>Balance:</b> ${formatBtc(balance)} 
+  let msg = `📊 <b>Address:</b> <code>${address}</code>\n💰 <b>Balance:</b> ${formatBtc(balance)}
